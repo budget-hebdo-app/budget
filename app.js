@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.5.2';
+const APP_VERSION = '2.6.0';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -86,7 +86,7 @@ function defaults() {
 
 /* ---------- Calcul du budget ---------- */
 let cache = { daily: new Map(), spentByDay: null };
-function invalidate() { cache = { daily: new Map(), spentByDay: null }; if (typeof scheduleFileSync === 'function') scheduleFileSync(); }
+function invalidate() { cache = { daily: new Map(), spentByDay: null }; if (typeof scheduleFileSync === 'function') scheduleFileSync(); if (typeof markDirty === 'function') markDirty(); }
 /* ---------- Mois budgétaire ----------
    Avec un jour de début J (ex. 25), le mois budgétaire « novembre » va du 25 octobre au 24 novembre.
    J = 1 : mois civil classique. */
@@ -310,7 +310,8 @@ function banners() {
   const noIncome = !S.monthItems.some(i => i.kind === 'income') && !S.incomeTypes.some(t => t.amount > 0);
   if (noIncome) h += `<div class="banner">👋 Bienvenue ! Commence par saisir ton salaire et tes charges fixes dans <b>Réglages</b>.<br><button class="btn" onclick="go('settings')">Ouvrir les réglages</button></div>`;
   const lb = S.settings.lastBackup;
-  if (!noIncome && S.expenses.length && (!lb || Date.now() - lb > 7 * 864e5)) h += `<div class="banner">☁️ ${lb ? 'Dernière sauvegarde il y a plus de 7 jours.' : 'Aucune sauvegarde pour l’instant.'} <br><button class="btn" onclick="A.backup()">Sauvegarder sur Google Drive</button></div>`;
+  h += syncBanner();
+  if (!S.settings.driveAuto && !noIncome && S.expenses.length && (!lb || Date.now() - lb > 7 * 864e5)) h += `<div class="banner">☁️ ${lb ? 'Dernière sauvegarde il y a plus de 7 jours.' : 'Aucune sauvegarde pour l’instant.'} <br><button class="btn" onclick="A.backup()">Sauvegarder sur Google Drive</button></div>`;
   if (dirHandle && fileState === 'locked') h += `<div class="banner">🔒 L’enregistrement dans le dossier « ${esc(dirHandle.name)} » attend ton autorisation.<br><button class="btn" onclick="A.fileUnlock()">Réactiver</button></div>`;
   const pend = pendingVariable(curYm());
   if (pend.length) h += `<div class="banner">⏳ En attente ce mois-ci : <b>${pend.map(t => esc(t.name)).join(', ')}</b>${estimatesFor(curYm()).length ? ' (estimation déjà comptée)' : ''}. Dès réception, saisis le montant réel pour mettre à jour tes semaines.<br><button class="btn" onclick="A.addIncome('${curYm()}','${pend[0].id}')">Saisir le montant reçu</button></div>`;
@@ -482,16 +483,19 @@ function viewSettings() {
     <label class="f"><span>Début du suivi (le budget est calculé à partir de cette date)</span><input type="date" value="${st.startDate}" onchange="A.setStart(this.value)"></label></div></div>`;
   h += `<div class="section"><h2>Sauvegarde Google Drive</h2><div class="list" style="padding:4px 14px 14px">
     <label class="f"><span>Identifiant client Google (voir le guide d’installation)</span><input id="cid" value="${esc(clientId())}" placeholder="xxxxxxxx.apps.googleusercontent.com"></label><button class="btn ghost block" onclick="A.setClientId($('#cid').value)">Enregistrer l’identifiant</button>${(window.BUDGET_CONFIG || {}).googleClientId ? '<p class="help">✅ Identifiant intégré à l’application (fichier config.js).</p>' : ''}
+    <label class="chk"><input type="checkbox" ${st.driveAuto ? 'checked' : ''} onchange="A.setDriveAuto(this.checked)"> Synchroniser automatiquement avec Google Drive après chaque modification</label>
+    <p class="help" id="sync-state">${syncStateText()}</p>
+    <p class="help">Le fichier <b>${DRIVE_DATA}</b> du dossier « ${DRIVE_FOLDER} » de ton Drive devient la copie de référence. Google redemande la connexion environ une fois par heure : un bandeau « Synchroniser » apparaît alors sur l’accueil.</p>
     <p class="help">Dernière sauvegarde : ${st.lastBackup ? new Date(st.lastBackup).toLocaleString('fr-FR') : 'jamais'}</p>
     <div id="drive-status" class="help"></div>
     <div class="btns"><button class="btn" onclick="A.backup()">☁️ Sauvegarder</button><button class="btn ghost" onclick="A.restore()">⤓ Restaurer</button></div>
     <p class="help">L’app n’a accès qu’au dossier « ${DRIVE_FOLDER} » qu’elle crée dans ton Drive.</p></div></div>`;
-  h += `<div class="section"><h2>Dossier de données</h2><div class="list" style="padding:4px 14px 14px">
+  h += `<div class="section"><details ${dirHandle ? 'open' : ''}><summary class="help" style="font-size:14px">Dossier du téléphone (expérimental, ne fonctionne pas sur tous les téléphones)</summary><div class="list" style="padding:4px 14px 14px;margin-top:8px">
     <p class="help">Choisis un dossier du téléphone (par exemple Documents › BudgetHebdo) : l’application y enregistre toute seule le fichier <b>${FILE_NAME}</b> et les photos des tickets, après chaque modification.</p>
     <p class="help" id="file-status">${fileStatusText()}</p>
     <div class="btns">${fileSupported() ? `<button class="btn" onclick="A.fileChoose()">📁 ${dirHandle ? 'Changer de dossier' : 'Choisir un dossier'}</button>` : ''}${dirHandle && fileState === 'locked' ? `<button class="btn" onclick="A.fileUnlock()">🔓 Autoriser l’écriture</button>` : ''}${dirHandle ? `<button class="btn ghost" onclick="A.fileTest()">🧪 Tester l’écriture</button><button class="btn ghost" onclick="A.fileLoad()">⤓ Recharger depuis le dossier</button>` : ''}</div>
     <details style="margin-top:10px"><summary class="help">Journal technique (à me copier en cas de souci)</summary><pre id="file-log" style="white-space:pre-wrap;font-size:12px;margin:6px 0 0">${esc(fileLog.join('\n') || 'Rien pour l’instant.')}</pre></details>
-    ${dirHandle ? `<div class="btns"><button class="btn ghost block" onclick="A.fileStop()">Ne plus utiliser ce dossier</button></div>` : ''}</div></div>`;
+    ${dirHandle ? `<div class="btns"><button class="btn ghost block" onclick="A.fileStop()">Ne plus utiliser ce dossier</button></div>` : ''}</div></details></div>`;
   h += `<div class="section"><h2>Fichier de secours</h2><div class="list" style="padding:4px 14px 14px">
     <p class="help">Exporte toutes tes données (photos comprises) dans un fichier, sans passer par Google.</p>
     <div class="btns"><button class="btn ghost" onclick="A.exportFile()">Exporter</button><label class="btn ghost">Importer<input type="file" accept="application/json,.json" hidden onchange="A.importFile(this.files[0])"></label></div></div></div>`;
@@ -964,6 +968,65 @@ async function gUpload(meta, blob, fileId) {
   const r = await gf(fileId ? `${UAPI}/${fileId}?uploadType=multipart&fields=id` : `${UAPI}?uploadType=multipart&fields=id`, { method: fileId ? 'PATCH' : 'POST', body: fd });
   return (await r.json()).id;
 }
+async function gMeta(id) { return (await gf(`${DAPI}/${id}?fields=id,modifiedTime`)).json(); }
+/* ---------- Synchronisation automatique avec Google Drive ----------
+   Le fichier budget-data.json du Drive est la copie de référence : il est réécrit tout seul après chaque modification
+   (quand la connexion Google est active), et rechargé si le Drive contient une version plus récente. */
+let driveBusy = false, driveTimer = null, driveQuiet = false, driveConflict = null;
+const tokenOk = () => !!gToken && Date.now() < gExp;
+const isDirty = () => { try { return localStorage.getItem('bh-dirty') === '1'; } catch { return false; } };
+const setDirty = v => { try { v ? localStorage.setItem('bh-dirty', '1') : localStorage.removeItem('bh-dirty'); } catch {} };
+function markDirty() { if (driveQuiet || !S.settings || !S.settings.driveAuto) return; setDirty(true); clearTimeout(driveTimer); driveTimer = setTimeout(() => driveSync(), 4000); }
+/* Envoi des données sur Drive. Renvoie 'ok', ou 'conflict' si le fichier du Drive a changé ailleurs (sauf force). */
+async function driveBackup(say, force) {
+  const folder = await gFolder();
+  const existing = await gFind(`name='${DRIVE_DATA}' and '${folder}' in parents and trashed=false`);
+  const known = S.settings.driveModified;
+  if (existing && !force && (!known || existing.modifiedTime !== known)) { driveConflict = existing; return 'conflict'; }
+  const photos = await dbAll('photos'); const todo = photos.filter(p => !p.driveId); let n = 0;
+  for (const p of todo) { n++; say(`Envoi des photos… ${n}/${todo.length}`); p.driveId = await gUpload({ name: `ticket-${p.id}.jpg`, parents: [folder] }, p.blob); await dbPut('photos', p); }
+  say('Envoi des données…');
+  const blob = new Blob([JSON.stringify(await snapshot(false))], { type: 'application/json' });
+  const id = await gUpload(existing ? { name: DRIVE_DATA } : { name: DRIVE_DATA, parents: [folder] }, blob, existing && existing.id);
+  const monthly = `budget-data-${curYm()}.json`; const m = await gFind(`name='${monthly}' and '${folder}' in parents and trashed=false`);
+  await gUpload(m ? { name: monthly } : { name: monthly, parents: [folder] }, blob, m && m.id);
+  const meta = await gMeta(id);
+  driveQuiet = true; S.settings.lastBackup = Date.now(); S.settings.driveModified = meta.modifiedTime; saveSettings(); driveQuiet = false;
+  setDirty(false); driveConflict = null; return 'ok';
+}
+async function driveRestore(say) {
+  const folder = await gFolder(); const f = await gFind(`name='${DRIVE_DATA}' and '${folder}' in parents and trashed=false`);
+  if (!f) throw new Error('Aucune sauvegarde trouvée sur le Drive');
+  const data = await (await gf(`${DAPI}/${f.id}?alt=media`)).json();
+  const auto = S.settings.driveAuto;
+  driveQuiet = true;
+  try { await importData(data, async p => p.driveId ? await (await gf(`${DAPI}/${p.driveId}?alt=media`)).blob() : null); S.settings.driveAuto = auto; S.settings.driveModified = f.modifiedTime; S.settings.lastBackup = Date.now(); saveSettings(); }
+  finally { driveQuiet = false; }
+  setDirty(false); driveConflict = null; applyTheme(); ui.month = curYm();
+}
+/* Synchronisation silencieuse : seulement si la connexion Google est encore valide, sinon un bandeau invite à toucher */
+async function driveSync() {
+  if (!S.settings.driveAuto || driveBusy || !isDirty()) return;
+  if (!tokenOk() || !navigator.onLine) { refreshSyncBanner(); return; }
+  driveBusy = true;
+  try { await driveBackup(() => {}, false); } catch (e) { console.warn('sync Drive', e); }
+  finally { driveBusy = false; refreshSyncBanner(); }
+}
+function syncBanner() {
+  if (!S.settings.driveAuto) return '';
+  if (driveConflict) return `<div class="banner" id="sync-banner">☁️ Le fichier sur Google Drive est différent de celui de ce téléphone (modifié le ${new Date(driveConflict.modifiedTime).toLocaleString('fr-FR')}).<div class="btns"><button class="btn" onclick="A.syncLoad()">Charger la version Drive</button><button class="btn ghost" onclick="A.syncForce()">Garder ce téléphone</button></div></div>`;
+  if (!clientId()) return `<div class="banner" id="sync-banner">☁️ Synchronisation Drive activée, mais l’identifiant Google manque (Réglages).</div>`;
+  if (isDirty() && !tokenOk()) return `<div class="banner" id="sync-banner">☁️ Des modifications ne sont pas encore sur Google Drive.<br><button class="btn" onclick="A.syncNow()">Synchroniser</button></div>`;
+  if (!tokenOk() && !S.settings.driveModified) return `<div class="banner" id="sync-banner">☁️ Connecte Google Drive pour démarrer la synchronisation.<br><button class="btn" onclick="A.syncNow()">Connecter</button></div>`;
+  return '<span id="sync-banner"></span>';
+}
+function refreshSyncBanner() { const el = $('#sync-banner'); if (el) el.outerHTML = syncBanner(); const s = $('#sync-state'); if (s) s.textContent = syncStateText(); }
+function syncStateText() {
+  if (!S.settings.driveAuto) return 'Synchronisation automatique désactivée.';
+  if (driveConflict) return '⚠️ Version différente sur le Drive : choix à faire sur l’accueil.';
+  if (isDirty()) return tokenOk() ? '⏳ Envoi en cours…' : '⏳ Modifications en attente : touche « Sauvegarder » ou le bandeau de l’accueil.';
+  return '✅ Drive à jour' + (S.settings.lastBackup ? ' (' + new Date(S.settings.lastBackup).toLocaleString('fr-FR') + ')' : '') + '.';
+}
 function dstat(t) { const e = $('#drive-status'); if (e) e.textContent = t; toast(t); }
 async function snapshot(withPhotoData) {
   const photos = await dbAll('photos'); const data = { app: 'budget-hebdo', version: 1, exportedAt: new Date().toISOString() };
@@ -1185,29 +1248,25 @@ const A = {
   async backup() {
     try {
       dstat('Connexion à Google…');
-      const folder = await gFolder();
-      const photos = await dbAll('photos'); const todo = photos.filter(p => !p.driveId); let n = 0;
-      for (const p of todo) { n++; dstat(`Envoi des photos… ${n}/${todo.length}`); p.driveId = await gUpload({ name: `ticket-${p.id}.jpg`, parents: [folder] }, p.blob); await dbPut('photos', p); }
-      dstat('Envoi des données…');
-      const blob = new Blob([JSON.stringify(await snapshot(false))], { type: 'application/json' });
-      const existing = await gFind(`name='${DRIVE_DATA}' and '${folder}' in parents and trashed=false`);
-      await gUpload(existing ? { name: DRIVE_DATA } : { name: DRIVE_DATA, parents: [folder] }, blob, existing && existing.id);
-      const monthly = `budget-data-${curYm()}.json`; const m = await gFind(`name='${monthly}' and '${folder}' in parents and trashed=false`);
-      await gUpload(m ? { name: monthly } : { name: monthly, parents: [folder] }, blob, m && m.id);
-      S.settings.lastBackup = Date.now(); saveSettings(); dstat('✅ Sauvegarde terminée'); render();
+      const r = await driveBackup(dstat, !S.settings.driveAuto);
+      if (r === 'conflict') { dstat('Le Drive contient une autre version : choisis sur l’accueil.'); go('week'); return; }
+      dstat('✅ Sauvegarde terminée'); render();
     } catch (e) { console.error(e); dstat('❌ ' + e.message); }
   },
   async restore() {
     if (!confirm('Remplacer les données de ce téléphone par la sauvegarde Google Drive ?')) return;
-    try {
-      dstat('Connexion à Google…');
-      const folder = await gFolder(); const f = await gFind(`name='${DRIVE_DATA}' and '${folder}' in parents and trashed=false`);
-      if (!f) throw new Error('Aucune sauvegarde trouvée sur le Drive');
-      const data = await (await gf(`${DAPI}/${f.id}?alt=media`)).json();
-      await importData(data, async p => p.driveId ? await (await gf(`${DAPI}/${p.driveId}?alt=media`)).blob() : null);
-      dstat('✅ Restauration terminée'); render();
-    } catch (e) { console.error(e); dstat('❌ ' + e.message); }
+    try { dstat('Connexion à Google…'); await driveRestore(dstat); dstat('✅ Restauration terminée'); render(); }
+    catch (e) { console.error(e); dstat('❌ ' + e.message); }
   },
+  setDriveAuto(v) { S.settings.driveAuto = v; driveQuiet = true; saveSettings(); driveQuiet = false; if (v) { setDirty(true); toast('Synchronisation automatique activée'); A.syncNow(); } else { toast('Synchronisation automatique désactivée'); render(); } },
+  /* Connexion (un toucher) puis envoi ; détecte une version différente sur le Drive */
+  async syncNow() {
+    try { toast('Connexion à Google…'); await token(); driveBusy = true; const r = await driveBackup(() => {}, false); toast(r === 'ok' ? '✅ Google Drive à jour' : 'Le Drive contient une autre version'); }
+    catch (e) { console.error(e); toast('❌ ' + e.message, 4000); }
+    finally { driveBusy = false; render(); }
+  },
+  async syncLoad() { try { toast('Chargement depuis Drive…'); await driveRestore(() => {}); toast('✅ Version Drive chargée'); } catch (e) { toast('❌ ' + e.message, 4000); } render(); },
+  async syncForce() { if (!confirm('Remplacer le fichier du Drive par les données de ce téléphone ?')) return; try { await token(); await driveBackup(() => {}, true); toast('✅ Drive remplacé par ce téléphone'); } catch (e) { toast('❌ ' + e.message, 4000); } render(); },
   async exportFile() {
     toast('Préparation du fichier…');
     const data = await snapshot(true); const a = document.createElement('a');
@@ -1264,4 +1323,6 @@ $('#fab').onclick = () => sheet(`<h3>Ajouter</h3>
     navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => r.update()).catch(() => {});
   }
   render();
+  window.addEventListener('online', () => driveSync());
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { driveSync(); refreshSyncBanner(); } });
 })();
