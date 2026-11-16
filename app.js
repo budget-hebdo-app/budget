@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.5.1';
+const APP_VERSION = '2.5.2';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -489,7 +489,7 @@ function viewSettings() {
   h += `<div class="section"><h2>Dossier de données</h2><div class="list" style="padding:4px 14px 14px">
     <p class="help">Choisis un dossier du téléphone (par exemple Documents › BudgetHebdo) : l’application y enregistre toute seule le fichier <b>${FILE_NAME}</b> et les photos des tickets, après chaque modification.</p>
     <p class="help" id="file-status">${fileStatusText()}</p>
-    <div class="btns">${fileSupported() ? `<button class="btn" onclick="A.fileChoose()">📁 ${dirHandle ? 'Changer de dossier' : 'Choisir un dossier'}</button>` : ''}${dirHandle && fileState === 'locked' ? `<button class="btn" onclick="A.fileUnlock()">🔓 Réactiver</button>` : ''}${dirHandle ? `<button class="btn ghost" onclick="A.fileTest()">🧪 Tester l’écriture</button><button class="btn ghost" onclick="A.fileLoad()">⤓ Recharger depuis le dossier</button>` : ''}</div>
+    <div class="btns">${fileSupported() ? `<button class="btn" onclick="A.fileChoose()">📁 ${dirHandle ? 'Changer de dossier' : 'Choisir un dossier'}</button>` : ''}${dirHandle && fileState === 'locked' ? `<button class="btn" onclick="A.fileUnlock()">🔓 Autoriser l’écriture</button>` : ''}${dirHandle ? `<button class="btn ghost" onclick="A.fileTest()">🧪 Tester l’écriture</button><button class="btn ghost" onclick="A.fileLoad()">⤓ Recharger depuis le dossier</button>` : ''}</div>
     <details style="margin-top:10px"><summary class="help">Journal technique (à me copier en cas de souci)</summary><pre id="file-log" style="white-space:pre-wrap;font-size:12px;margin:6px 0 0">${esc(fileLog.join('\n') || 'Rien pour l’instant.')}</pre></details>
     ${dirHandle ? `<div class="btns"><button class="btn ghost block" onclick="A.fileStop()">Ne plus utiliser ce dossier</button></div>` : ''}</div></div>`;
   h += `<div class="section"><h2>Fichier de secours</h2><div class="list" style="padding:4px 14px 14px">
@@ -1038,7 +1038,7 @@ async function fileSync() {
 function fileStatusText() {
   if (!fileSupported() && !dirHandle) return '❌ Cette fonction n’est pas disponible dans ce navigateur. Garde la sauvegarde Google Drive.';
   if (!dirHandle) return 'Aucun dossier choisi : les données restent seulement dans le navigateur.';
-  if (fileState === 'locked') return `🔒 Dossier « ${esc(dirHandle.name)} » : autorisation à redonner. Touche « Réactiver ».`;
+  if (fileState === 'locked') return `🔒 Dossier « ${esc(dirHandle.name)} » choisi, mais Chrome n’a pas encore autorisé l’écriture. Touche « Autoriser l’écriture ».`;
   if (fileState === 'error') return `⚠️ Dossier « ${esc(dirHandle.name)} » : écriture impossible (${esc(fileErr)}).`;
   return `✅ Dossier « ${esc(dirHandle.name)} » : fichier ${FILE_NAME} ${fileLast ? 'enregistré le ' + new Date(fileLast).toLocaleString('fr-FR') : 'en attente du premier enregistrement'}.`;
 }
@@ -1111,18 +1111,22 @@ const A = {
   setCycle(v) { S.settings.cycleDay = +v; saveSettings(); ui.month = curYm(); toast(+v === 1 ? 'Mois civil' : 'Mois budgétaire du ' + v + ' au ' + (v - 1)); render(); },
   async fileChoose() {
     let h;
-    try { flog('ouverture du sélecteur de dossier'); h = await window.showDirectoryPicker({ mode: 'readwrite' }); }
-    catch (e) { flog('sélecteur fermé : ' + errTxt(e)); if (e.name !== 'AbortError') alert('Impossible d’ouvrir le sélecteur : ' + errTxt(e)); render(); return; }
+    try { flog('ouverture du sélecteur de dossier (lecture)'); h = await window.showDirectoryPicker(); }
+    catch (e) { flog('sélecteur fermé : ' + errTxt(e)); alert(e.name === 'AbortError' ? 'Le choix du dossier a été annulé (par toi ou par Chrome). Réessaie, ou choisis un sous-dossier de Documents.' : 'Impossible d’ouvrir le sélecteur : ' + errTxt(e)); render(); return; }
     flog('dossier choisi : « ' + h.name + ' »');
-    dirHandle = h; fileState = 'ok';
+    dirHandle = h; fileState = 'locked';
+    // autorisation d'écriture : demandée tout de suite si Chrome l'accepte, sinon par le bouton « Autoriser l'écriture »
+    try { const q = await h.queryPermission({ mode: 'readwrite' }); flog('autorisation d’écriture actuelle : ' + q); if (q === 'granted') fileState = 'ok'; else { const r = await h.requestPermission({ mode: 'readwrite' }); flog('réponse à la demande d’écriture : ' + r); if (r === 'granted') fileState = 'ok'; } }
+    catch (e) { flog('demande d’écriture reportée (' + errTxt(e) + ')'); }
     try { await dbPut('settings', { id: 'dir', handle: h }); flog('dossier mémorisé'); } catch (e) { flog('mémorisation impossible : ' + errTxt(e)); }
     let existing = null; try { existing = await readDataFrom(h); flog('un fichier ' + FILE_NAME + ' existe déjà dans ce dossier'); } catch (e) { flog('pas de fichier existant (' + (e.name || 'vide') + ')'); }
     try {
       if (existing && existing.data && existing.data.app === 'budget-hebdo' && confirm(`Ce dossier contient déjà un fichier ${FILE_NAME} (enregistré le ${new Date(existing.data.savedAt || existing.data.exportedAt).toLocaleString('fr-FR')}).\n\nOK = charger ces données dans l’application.\nAnnuler = les remplacer par les données actuelles de l’application.`)) {
         await importData(existing.data, existing.getPhoto); applyTheme(); ui.month = curYm(); flog('données chargées depuis le dossier');
-      } else await fileSync();
+      } else if (fileState === 'ok') await fileSync();
     } catch (e) { fileState = 'error'; fileErr = errTxt(e); flog('ÉCHEC : ' + fileErr); }
     render();
+    if (fileState === 'locked') { alert(`Dossier « ${h.name} » choisi.\n\nDernière étape : touche le bouton « 🔓 Autoriser l’écriture » et accepte la demande de Chrome.`); return; }
     alert(fileState === 'ok' ? `✅ Dossier « ${h.name} » prêt : le fichier ${FILE_NAME} y est enregistré.` : `⚠️ Écriture impossible dans « ${h.name} ».\n\n${fileErr || 'Autorisation refusée.'}\n\nEssaie un sous-dossier de Documents ou de Téléchargements.`);
   },
   async fileTest() {
@@ -1136,7 +1140,15 @@ const A = {
     } catch (e) { fileState = 'error'; fileErr = errTxt(e); flog('test : ÉCHEC ' + fileErr); alert('⚠️ Test échoué :\n' + fileErr); }
     render();
   },
-  async fileUnlock() { try { if (await filePermission(true)) { fileState = 'ok'; await fileSync(); toast('Dossier réactivé'); } else toast('Autorisation refusée'); } catch (e) { alert(e.message); } render(); },
+  async fileUnlock() {
+    if (!dirHandle) return;
+    try {
+      const r = await dirHandle.requestPermission({ mode: 'readwrite' }); flog('réponse à la demande d’écriture : ' + r);
+      if (r === 'granted') { fileState = 'ok'; await fileSync(); render(); alert(fileState === 'ok' ? `✅ Écriture autorisée : ${FILE_NAME} est enregistré dans « ${dirHandle.name} ».` : '⚠️ Autorisation donnée, mais écriture impossible :\n' + fileErr); return; }
+      render();
+      alert('Chrome a refusé l’écriture' + (r === 'denied' ? ' sans te poser la question : il a retenu un refus précédent.' : '.') + '\n\nPour débloquer : dans Chrome, ouvre ⋮ › Paramètres › Paramètres des sites, cherche « Modification de fichiers » (ou « Fichiers »), et retire le blocage pour ce site. Ou attends quelques jours : ce blocage automatique est temporaire.');
+    } catch (e) { flog('demande d’écriture impossible : ' + errTxt(e)); alert('Demande impossible : ' + errTxt(e)); render(); }
+  },
   async fileLoad() {
     if (!dirHandle || !confirm('Remplacer les données de l’application par celles du fichier du dossier ?')) return;
     try { if (!(await filePermission(true))) { toast('Autorisation refusée'); return; } const r = await readDataFrom(dirHandle); await importData(r.data, r.getPhoto); applyTheme(); ui.month = curYm(); toast('✅ Données rechargées'); render(); }
