@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.4.5';
+const APP_VERSION = '2.5.0';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -86,7 +86,7 @@ function defaults() {
 
 /* ---------- Calcul du budget ---------- */
 let cache = { daily: new Map(), spentByDay: null };
-function invalidate() { cache = { daily: new Map(), spentByDay: null }; }
+function invalidate() { cache = { daily: new Map(), spentByDay: null }; if (typeof scheduleFileSync === 'function') scheduleFileSync(); }
 /* ---------- Mois budgétaire ----------
    Avec un jour de début J (ex. 25), le mois budgétaire « novembre » va du 25 octobre au 24 novembre.
    J = 1 : mois civil classique. */
@@ -283,12 +283,35 @@ const catOf = id => S.categories.find(c => c.id === id) || { name: 'Sans catégo
 const HUES = [145, 200, 30, 280, 340, 50, 175, 230];
 const catHue = id => HUES[Math.max(0, S.categories.findIndex(c => c.id === id)) % HUES.length];
 
+/* ---------- Solde du compte bancaire ----------
+   Solde saisi à une date + revenus reçus depuis − charges fixes des mois budgétaires commencés depuis − dépenses saisies depuis. */
+function accountState() {
+  const a = S.settings.account; if (!a || !a.date) return null;
+  const D = a.date, T = today(); if (T < D) return { ...a, incomes: [], charges: [], spent: 0, balance: a.amount };
+  for (let d = D; d <= T; d = addDays(d, 1)) incomeOn(d); // crée les lignes de revenus fixes des périodes concernées
+  const incomes = S.monthItems.filter(i => i.kind === 'income' && i.date > D && i.date <= T).sort((x, y) => x.date.localeCompare(y.date));
+  const charges = [];
+  for (let ym = cycleOf(D); cycleStart(ym) <= T; ym = addMonths(ym, 1)) {
+    const cs = cycleStart(ym); if (!(cs > D || (a.pendingCharges && ym === cycleOf(D)))) continue;
+    ensureMonth(ym); const tot = S.monthItems.filter(i => i.month === ym && i.kind === 'charge').reduce((s, i) => s + i.amount, 0);
+    if (tot) charges.push({ ym, amount: tot });
+  }
+  const spent = S.expenses.filter(e => e.date >= D && e.date <= T).reduce((s, e) => s + e.amount, 0);
+  const tI = incomes.reduce((s, i) => s + i.amount, 0), tC = charges.reduce((s, c) => s + c.amount, 0);
+  return { ...a, incomes, charges, spent, tI, tC, balance: a.amount + tI - tC - spent };
+}
+function accountCard() {
+  const st = accountState();
+  if (!st) return `<div class="acct" onclick="A.accountSet()"><span class="ico">🏦</span><div class="mid"><div>Solde du compte bancaire</div><small>Touche pour saisir ton solde de départ</small></div><div class="amt">›</div></div>`;
+  return `<div class="acct" onclick="A.accountDetail()"><span class="ico">🏦</span><div class="mid"><div>Compte bancaire (estimé)</div><small>d’après ton solde du ${fshort(st.date)}</small></div><div class="amt ${st.balance < 0 ? 'neg' : ''}">${fmt(st.balance)}</div></div>`;
+}
 function banners() {
   let h = '';
   const noIncome = !S.monthItems.some(i => i.kind === 'income') && !S.incomeTypes.some(t => t.amount > 0);
   if (noIncome) h += `<div class="banner">👋 Bienvenue ! Commence par saisir ton salaire et tes charges fixes dans <b>Réglages</b>.<br><button class="btn" onclick="go('settings')">Ouvrir les réglages</button></div>`;
   const lb = S.settings.lastBackup;
   if (!noIncome && S.expenses.length && (!lb || Date.now() - lb > 7 * 864e5)) h += `<div class="banner">☁️ ${lb ? 'Dernière sauvegarde il y a plus de 7 jours.' : 'Aucune sauvegarde pour l’instant.'} <br><button class="btn" onclick="A.backup()">Sauvegarder sur Google Drive</button></div>`;
+  if (dirHandle && fileState === 'locked') h += `<div class="banner">🔒 L’enregistrement dans le dossier « ${esc(dirHandle.name)} » attend ton autorisation.<br><button class="btn" onclick="A.fileUnlock()">Réactiver</button></div>`;
   const pend = pendingVariable(curYm());
   if (pend.length) h += `<div class="banner">⏳ En attente ce mois-ci : <b>${pend.map(t => esc(t.name)).join(', ')}</b>${estimatesFor(curYm()).length ? ' (estimation déjà comptée)' : ''}. Dès réception, saisis le montant réel pour mettre à jour tes semaines.<br><button class="btn" onclick="A.addIncome('${curYm()}','${pend[0].id}')">Saisir le montant reçu</button></div>`;
   return h;
@@ -351,6 +374,7 @@ function viewWeek() {
     <div class="stat"><small>Dépensé</small><b>${fmt(st.spent)}</b></div>
   </div>
   ${partsTxt ? `<p class="help" style="padding:0 22px">Semaine à cheval sur deux mois : ${partsTxt}</p>` : ''}
+  ${accountCard()}
   <div class="section"><h2>Par catégorie</h2></div>
   <div class="circles">${circles}</div>
   <div class="section"><h2>Mes dépenses</h2>`;
@@ -462,6 +486,11 @@ function viewSettings() {
     <div id="drive-status" class="help"></div>
     <div class="btns"><button class="btn" onclick="A.backup()">☁️ Sauvegarder</button><button class="btn ghost" onclick="A.restore()">⤓ Restaurer</button></div>
     <p class="help">L’app n’a accès qu’au dossier « ${DRIVE_FOLDER} » qu’elle crée dans ton Drive.</p></div></div>`;
+  h += `<div class="section"><h2>Dossier de données</h2><div class="list" style="padding:4px 14px 14px">
+    <p class="help">Choisis un dossier du téléphone (par exemple Documents › BudgetHebdo) : l’application y enregistre toute seule le fichier <b>${FILE_NAME}</b> et les photos des tickets, après chaque modification.</p>
+    <p class="help" id="file-status">${fileStatusText()}</p>
+    <div class="btns">${fileSupported() ? `<button class="btn" onclick="A.fileChoose()">📁 ${dirHandle ? 'Changer de dossier' : 'Choisir un dossier'}</button>` : ''}${dirHandle && fileState === 'locked' ? `<button class="btn" onclick="A.fileUnlock()">🔓 Réactiver</button>` : ''}${dirHandle ? `<button class="btn ghost" onclick="A.fileLoad()">⤓ Recharger depuis le dossier</button>` : ''}</div>
+    ${dirHandle ? `<div class="btns"><button class="btn ghost block" onclick="A.fileStop()">Ne plus utiliser ce dossier</button></div>` : ''}</div></div>`;
   h += `<div class="section"><h2>Fichier de secours</h2><div class="list" style="padding:4px 14px 14px">
     <p class="help">Exporte toutes tes données (photos comprises) dans un fichier, sans passer par Google.</p>
     <div class="btns"><button class="btn ghost" onclick="A.exportFile()">Exporter</button><label class="btn ghost">Importer<input type="file" accept="application/json,.json" hidden onchange="A.importFile(this.files[0])"></label></div></div></div>`;
@@ -945,6 +974,7 @@ const blobToDataUrl = b => new Promise(r => { const f = new FileReader(); f.onlo
 async function importData(data, getPhoto) {
   if (!data || data.app !== 'budget-hebdo') throw new Error('Fichier non reconnu');
   for (const s of STORES) await dbClear(s);
+  if (dirHandle) await dbPut('settings', { id: 'dir', handle: dirHandle });
   const keep = { clientId: S.settings.clientId };
   S.settings = Object.assign({ months: {} }, data.settings, keep.clientId ? keep : {}); await dbPut('settings', S.settings);
   for (const s of LIST_STORES) { S[s] = data[s] || []; for (const o of S[s]) await dbPut(s, o); }
@@ -954,6 +984,56 @@ async function importData(data, getPhoto) {
     n++; dstat(`Restauration des photos… ${n}/${data.photos.length}`);
   }
   invalidate();
+}
+
+/* ---------- Fichier de données dans un dossier du téléphone ----------
+   L'utilisateur choisit un dossier une fois ; l'application y écrit budget.json (toutes les données)
+   et un sous-dossier tickets/ (les photos) après chaque modification. Le stockage du navigateur ne sert plus que de copie de travail. */
+const FILE_NAME = 'budget.json', FILE_PHOTOS = 'tickets';
+const fileSupported = () => typeof window.showDirectoryPicker === 'function';
+let dirHandle = null, fileState = 'off', fileTimer = null, fileBusy = false, fileLast = null, fileErr = '';
+async function writeDataTo(dir) {
+  const photos = await dbAll('photos');
+  if (photos.length) {
+    const pdir = await dir.getDirectoryHandle(FILE_PHOTOS, { create: true });
+    const have = new Set(); for await (const name of pdir.keys()) have.add(name);
+    for (const p of photos) { const n = `ticket-${p.id}.jpg`; if (have.has(n)) continue; const w = await (await pdir.getFileHandle(n, { create: true })).createWritable(); await w.write(p.blob); await w.close(); }
+  }
+  const data = await snapshot(false); data.savedAt = new Date().toISOString();
+  // createWritable écrit dans un fichier temporaire et ne remplace budget.json qu'à la fermeture : l'ancien reste intact en cas d'échec
+  const w = await (await dir.getFileHandle(FILE_NAME, { create: true })).createWritable(); await w.write(JSON.stringify(data, null, 1)); await w.close();
+  return data.savedAt;
+}
+async function readDataFrom(dir) {
+  const f = await (await dir.getFileHandle(FILE_NAME)).getFile(); const data = JSON.parse(await f.text());
+  let pdir = null; try { pdir = await dir.getDirectoryHandle(FILE_PHOTOS); } catch {}
+  return { data, getPhoto: async p => { if (!pdir) return null; try { const f = await (await pdir.getFileHandle(`ticket-${p.id}.jpg`)).getFile(); return new Blob([await f.arrayBuffer()], { type: 'image/jpeg' }); } catch { return null; } } }; // copie en mémoire : indépendante du fichier
+}
+async function filePermission(ask) {
+  if (!dirHandle) return false;
+  const o = { mode: 'readwrite' };
+  if (!dirHandle.queryPermission) return true; // dossier interne (tests)
+  if (await dirHandle.queryPermission(o) === 'granted') return true;
+  return ask ? (await dirHandle.requestPermission(o)) === 'granted' : false;
+}
+function scheduleFileSync() { if (!dirHandle || fileState === 'off') return; clearTimeout(fileTimer); fileTimer = setTimeout(fileSync, 1200); }
+async function fileSync() {
+  if (!dirHandle || fileBusy) return; fileBusy = true;
+  try {
+    if (!(await filePermission(false))) { fileState = 'locked'; return; }
+    fileLast = await writeDataTo(dirHandle); fileState = 'ok'; fileErr = '';
+  } catch (e) { console.error(e); fileState = 'error'; fileErr = e.message || String(e); }
+  finally { fileBusy = false; const el = $('#file-status'); if (el) el.innerHTML = fileStatusText(); }
+}
+function fileStatusText() {
+  if (!fileSupported() && !dirHandle) return '❌ Cette fonction n’est pas disponible dans ce navigateur. Garde la sauvegarde Google Drive.';
+  if (!dirHandle) return 'Aucun dossier choisi : les données restent seulement dans le navigateur.';
+  if (fileState === 'locked') return `🔒 Dossier « ${esc(dirHandle.name)} » : autorisation à redonner. Touche « Réactiver ».`;
+  if (fileState === 'error') return `⚠️ Dossier « ${esc(dirHandle.name)} » : écriture impossible (${esc(fileErr)}).`;
+  return `✅ Dossier « ${esc(dirHandle.name)} » : fichier ${FILE_NAME} ${fileLast ? 'enregistré le ' + new Date(fileLast).toLocaleString('fr-FR') : 'en attente du premier enregistrement'}.`;
+}
+async function fileInit() {
+  try { const rec = await dbGet('settings', 'dir'); if (rec && rec.handle) { dirHandle = rec.handle; fileState = (await filePermission(false)) ? 'ok' : 'locked'; } } catch (e) { console.warn(e); }
 }
 
 /* ---------- Installation PWA ---------- */
@@ -1019,6 +1099,48 @@ const A = {
   },
   setTheme(v) { S.settings.theme = v; saveSettings(); applyTheme(); },
   setCycle(v) { S.settings.cycleDay = +v; saveSettings(); ui.month = curYm(); toast(+v === 1 ? 'Mois civil' : 'Mois budgétaire du ' + v + ' au ' + (v - 1)); render(); },
+  async fileChoose() {
+    try {
+      const h = await window.showDirectoryPicker({ mode: 'readwrite', id: 'budget-hebdo' });
+      let existing = null; try { existing = await readDataFrom(h); } catch {}
+      dirHandle = h; await dbPut('settings', { id: 'dir', handle: h }); fileState = 'ok';
+      if (existing && existing.data && existing.data.app === 'budget-hebdo' && confirm(`Ce dossier contient déjà un fichier ${FILE_NAME} (enregistré le ${new Date(existing.data.savedAt || existing.data.exportedAt).toLocaleString('fr-FR')}).\n\nOK = charger ces données dans l’application.\nAnnuler = les remplacer par les données actuelles de l’application.`)) {
+        await importData(existing.data, existing.getPhoto); applyTheme(); ui.month = curYm(); toast('Données chargées depuis le dossier');
+      } else { await fileSync(); toast(fileState === 'ok' ? 'Dossier prêt : données enregistrées' : 'Écriture impossible dans ce dossier'); }
+      render();
+    } catch (e) { if (e.name !== 'AbortError') { console.error(e); alert('Impossible d’utiliser ce dossier : ' + e.message); } }
+  },
+  async fileUnlock() { try { if (await filePermission(true)) { fileState = 'ok'; await fileSync(); toast('Dossier réactivé'); } else toast('Autorisation refusée'); } catch (e) { alert(e.message); } render(); },
+  async fileLoad() {
+    if (!dirHandle || !confirm('Remplacer les données de l’application par celles du fichier du dossier ?')) return;
+    try { if (!(await filePermission(true))) { toast('Autorisation refusée'); return; } const r = await readDataFrom(dirHandle); await importData(r.data, r.getPhoto); applyTheme(); ui.month = curYm(); toast('✅ Données rechargées'); render(); }
+    catch (e) { alert('Lecture impossible : ' + e.message); }
+  },
+  async fileStop() { if (!confirm('Arrêter d’enregistrer dans ce dossier ? Le fichier déjà écrit n’est pas supprimé.')) return; dirHandle = null; fileState = 'off'; await dbDel('settings', 'dir'); render(); },
+  accountSet() {
+    const a = S.settings.account || { amount: '', date: today(), pendingCharges: true };
+    const vals = { ...a, amount: a.amount === '' ? '' : Math.abs(a.amount), negative: a.amount < 0 };
+    form('Solde du compte bancaire', [
+      { k: 'amount', l: 'Solde affiché par ta banque (F CFP)', t: 'money', help: 'Le solde réel de ton compte, tel que ta banque l’affiche.' },
+      { k: 'negative', l: 'Le compte est à découvert (solde négatif)', t: 'chk' },
+      { k: 'date', l: 'Date de ce solde', t: 'date', help: 'Saisis-le avant d’enregistrer les dépenses du jour : toutes les dépenses à partir de cette date seront déduites.' },
+      { k: 'pendingCharges', l: 'Les charges fixes du mois en cours ne sont pas encore prélevées', t: 'chk', help: 'Cochée : les charges du mois budgétaire en cours sont déduites du solde estimé. Décochée : elles sont considérées comme déjà payées.' }], vals,
+      v => { S.settings.account = { amount: v.negative ? -Math.abs(v.amount) : Math.abs(v.amount), date: v.date || today(), pendingCharges: v.pendingCharges }; saveSettings(); toast('Solde du compte enregistré'); },
+      S.settings.account ? () => { delete S.settings.account; saveSettings(); } : null);
+  },
+  accountDetail() {
+    const st = accountState(); if (!st) return A.accountSet();
+    const line = (ico, label, sub, amt, cls) => `<div class="row"><span class="ico">${ico}</span><div class="mid"><div>${label}</div>${sub ? `<small>${sub}</small>` : ''}</div><div class="amt ${cls || ''}">${amt}</div></div>`;
+    let h = `<h3>Compte bancaire (estimé)</h3><div class="list">`;
+    h += line('🏦', 'Solde saisi', 'le ' + fshort(st.date), fmt(st.amount));
+    st.incomes.forEach(i => h += line('💶', esc(i.name), 'le ' + fshort(i.date), '+' + fmt(i.amount), 'pos'));
+    st.charges.forEach(c => h += line('📄', 'Charges fixes', 'budget de ' + fdate(c.ym + '-01', { month: 'long' }), '−' + fmt(c.amount), 'neg'));
+    h += line('🧾', 'Dépenses saisies', 'depuis le ' + fshort(st.date), '−' + fmt(st.spent), 'neg');
+    h += `<div class="row total-row"><span class="ico">=</span><div class="mid"><div>Solde estimé aujourd’hui</div></div><div class="amt ${st.balance < 0 ? 'neg' : 'pos'}">${fmt(st.balance)}</div></div></div>
+      <p class="help">C’est une estimation : elle ne connaît que ce qui est saisi dans l’application. Si ta banque affiche un autre montant, touche « Recaler » et saisis le vrai solde.</p>
+      <div class="btns"><button class="btn" onclick="A.accountSet()">Recaler le solde</button><button class="btn ghost" onclick="closeSheet()">Fermer</button></div>`;
+    sheet(h);
+  },
   setCarry(v) { S.settings.carryOver = v; saveSettings(); },
   setStart(v) { if (!v) return; S.settings.startDate = v; saveSettings(); toast('Date de début mise à jour'); },
   setClientId(v) { S.settings.clientId = v.trim(); gToken = null; saveSettings(); toast('Identifiant enregistré'); },
@@ -1093,6 +1215,7 @@ $('#fab').onclick = () => sheet(`<h3>Ajouter</h3>
   if (!S.settings) defaults();
   else for (const s of LIST_STORES) S[s] = await dbAll(s);
   S.settings.months = S.settings.months || {};
+  await fileInit();
   ui.month = curYm();
   applyTheme();
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
