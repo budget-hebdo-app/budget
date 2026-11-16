@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.6.0';
+const APP_VERSION = '2.6.1';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -963,6 +963,13 @@ async function gFolder() {
   if (!f) f = await (await gf(`${DAPI}?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: DRIVE_FOLDER, mimeType: 'application/vnd.google-apps.folder' }) })).json();
   return f.id;
 }
+/* Sous-dossier « Tickets » du dossier Budget Hebdo : toutes les photos y sont rangées */
+const DRIVE_TICKETS = 'Tickets';
+async function gTicketsFolder(parent) {
+  let f = await gFind(`name='${DRIVE_TICKETS}' and '${parent}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  if (!f) f = await (await gf(`${DAPI}?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: DRIVE_TICKETS, mimeType: 'application/vnd.google-apps.folder', parents: [parent] }) })).json();
+  return f.id;
+}
 async function gUpload(meta, blob, fileId) {
   const fd = new FormData(); fd.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' })); fd.append('file', blob);
   const r = await gf(fileId ? `${UAPI}/${fileId}?uploadType=multipart&fields=id` : `${UAPI}?uploadType=multipart&fields=id`, { method: fileId ? 'PATCH' : 'POST', body: fd });
@@ -984,7 +991,15 @@ async function driveBackup(say, force) {
   const known = S.settings.driveModified;
   if (existing && !force && (!known || existing.modifiedTime !== known)) { driveConflict = existing; return 'conflict'; }
   const photos = await dbAll('photos'); const todo = photos.filter(p => !p.driveId); let n = 0;
-  for (const p of todo) { n++; say(`Envoi des photos… ${n}/${todo.length}`); p.driveId = await gUpload({ name: `ticket-${p.id}.jpg`, parents: [folder] }, p.blob); await dbPut('photos', p); }
+  if (photos.length) {
+    const tdir = await gTicketsFolder(folder);
+    for (const p of todo) { n++; say(`Envoi des photos… ${n}/${todo.length}`); p.driveId = await gUpload({ name: `ticket-${p.id}.jpg`, parents: [tdir] }, p.blob); p.inTickets = true; await dbPut('photos', p); }
+    // photos déjà envoyées à la racine du dossier (anciennes versions) : on les déplace dans « Tickets »
+    for (const p of photos.filter(x => x.driveId && !x.inTickets)) {
+      try { await gf(`${DAPI}/${p.driveId}?addParents=${tdir}&removeParents=${folder}&fields=id`, { method: 'PATCH' }); } catch (e) { console.warn('déplacement photo', p.id, e); }
+      p.inTickets = true; await dbPut('photos', p);
+    }
+  }
   say('Envoi des données…');
   const blob = new Blob([JSON.stringify(await snapshot(false))], { type: 'application/json' });
   const id = await gUpload(existing ? { name: DRIVE_DATA } : { name: DRIVE_DATA, parents: [folder] }, blob, existing && existing.id);
@@ -1031,7 +1046,7 @@ function dstat(t) { const e = $('#drive-status'); if (e) e.textContent = t; toas
 async function snapshot(withPhotoData) {
   const photos = await dbAll('photos'); const data = { app: 'budget-hebdo', version: 1, exportedAt: new Date().toISOString() };
   data.settings = { ...S.settings }; LIST_STORES.forEach(s => data[s] = S[s]);
-  data.photos = withPhotoData ? await Promise.all(photos.map(async p => ({ id: p.id, driveId: p.driveId, data: await blobToDataUrl(p.blob) }))) : photos.map(p => ({ id: p.id, driveId: p.driveId }));
+  data.photos = withPhotoData ? await Promise.all(photos.map(async p => ({ id: p.id, driveId: p.driveId, data: await blobToDataUrl(p.blob) }))) : photos.map(p => ({ id: p.id, driveId: p.driveId, inTickets: !!p.inTickets }));
   return data;
 }
 const blobToDataUrl = b => new Promise(r => { const f = new FileReader(); f.onload = () => r(f.result); f.readAsDataURL(b); });
@@ -1044,7 +1059,7 @@ async function importData(data, getPhoto) {
   for (const s of LIST_STORES) { S[s] = data[s] || []; for (const o of S[s]) await dbPut(s, o); }
   photoUrls.clear(); let n = 0;
   for (const p of data.photos || []) {
-    try { const blob = await getPhoto(p); if (blob) await dbPut('photos', { id: p.id, blob, driveId: p.driveId || null }); } catch (e) { console.warn('photo', p.id, e); }
+    try { const blob = await getPhoto(p); if (blob) await dbPut('photos', { id: p.id, blob, driveId: p.driveId || null, inTickets: !!p.inTickets }); } catch (e) { console.warn('photo', p.id, e); }
     n++; dstat(`Restauration des photos… ${n}/${data.photos.length}`);
   }
   invalidate();
