@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.5.0';
+const APP_VERSION = '2.5.1';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -489,7 +489,8 @@ function viewSettings() {
   h += `<div class="section"><h2>Dossier de données</h2><div class="list" style="padding:4px 14px 14px">
     <p class="help">Choisis un dossier du téléphone (par exemple Documents › BudgetHebdo) : l’application y enregistre toute seule le fichier <b>${FILE_NAME}</b> et les photos des tickets, après chaque modification.</p>
     <p class="help" id="file-status">${fileStatusText()}</p>
-    <div class="btns">${fileSupported() ? `<button class="btn" onclick="A.fileChoose()">📁 ${dirHandle ? 'Changer de dossier' : 'Choisir un dossier'}</button>` : ''}${dirHandle && fileState === 'locked' ? `<button class="btn" onclick="A.fileUnlock()">🔓 Réactiver</button>` : ''}${dirHandle ? `<button class="btn ghost" onclick="A.fileLoad()">⤓ Recharger depuis le dossier</button>` : ''}</div>
+    <div class="btns">${fileSupported() ? `<button class="btn" onclick="A.fileChoose()">📁 ${dirHandle ? 'Changer de dossier' : 'Choisir un dossier'}</button>` : ''}${dirHandle && fileState === 'locked' ? `<button class="btn" onclick="A.fileUnlock()">🔓 Réactiver</button>` : ''}${dirHandle ? `<button class="btn ghost" onclick="A.fileTest()">🧪 Tester l’écriture</button><button class="btn ghost" onclick="A.fileLoad()">⤓ Recharger depuis le dossier</button>` : ''}</div>
+    <details style="margin-top:10px"><summary class="help">Journal technique (à me copier en cas de souci)</summary><pre id="file-log" style="white-space:pre-wrap;font-size:12px;margin:6px 0 0">${esc(fileLog.join('\n') || 'Rien pour l’instant.')}</pre></details>
     ${dirHandle ? `<div class="btns"><button class="btn ghost block" onclick="A.fileStop()">Ne plus utiliser ce dossier</button></div>` : ''}</div></div>`;
   h += `<div class="section"><h2>Fichier de secours</h2><div class="list" style="padding:4px 14px 14px">
     <p class="help">Exporte toutes tes données (photos comprises) dans un fichier, sans passer par Google.</p>
@@ -992,16 +993,25 @@ async function importData(data, getPhoto) {
 const FILE_NAME = 'budget.json', FILE_PHOTOS = 'tickets';
 const fileSupported = () => typeof window.showDirectoryPicker === 'function';
 let dirHandle = null, fileState = 'off', fileTimer = null, fileBusy = false, fileLast = null, fileErr = '';
+/* Journal des étapes (affiché dans Réglages) pour comprendre un échec sur le téléphone */
+const fileLog = [];
+function flog(msg) { fileLog.push(new Date().toLocaleTimeString('fr-FR') + ' — ' + msg); if (fileLog.length > 30) fileLog.shift(); const el = $('#file-log'); if (el) el.textContent = fileLog.join('\n'); }
+const errTxt = e => (e && (e.name ? e.name + ' : ' : '') + (e.message || String(e))) || 'erreur inconnue';
+/* Écrit un fichier ; si le remplacement échoue (certains dossiers Android), on supprime puis on recrée */
+async function writeFile(dir, name, content) {
+  try { const w = await (await dir.getFileHandle(name, { create: true })).createWritable(); await w.write(content); await w.close(); }
+  catch (e) { flog('écriture directe de ' + name + ' refusée (' + errTxt(e) + '), 2e essai'); try { await dir.removeEntry(name); } catch {} const w = await (await dir.getFileHandle(name, { create: true })).createWritable(); await w.write(content); await w.close(); }
+}
 async function writeDataTo(dir) {
   const photos = await dbAll('photos');
   if (photos.length) {
     const pdir = await dir.getDirectoryHandle(FILE_PHOTOS, { create: true });
     const have = new Set(); for await (const name of pdir.keys()) have.add(name);
-    for (const p of photos) { const n = `ticket-${p.id}.jpg`; if (have.has(n)) continue; const w = await (await pdir.getFileHandle(n, { create: true })).createWritable(); await w.write(p.blob); await w.close(); }
+    for (const p of photos) { const n = `ticket-${p.id}.jpg`; if (have.has(n)) continue; await writeFile(pdir, n, p.blob); }
   }
   const data = await snapshot(false); data.savedAt = new Date().toISOString();
   // createWritable écrit dans un fichier temporaire et ne remplace budget.json qu'à la fermeture : l'ancien reste intact en cas d'échec
-  const w = await (await dir.getFileHandle(FILE_NAME, { create: true })).createWritable(); await w.write(JSON.stringify(data, null, 1)); await w.close();
+  await writeFile(dir, FILE_NAME, JSON.stringify(data, null, 1));
   return data.savedAt;
 }
 async function readDataFrom(dir) {
@@ -1020,9 +1030,9 @@ function scheduleFileSync() { if (!dirHandle || fileState === 'off') return; cle
 async function fileSync() {
   if (!dirHandle || fileBusy) return; fileBusy = true;
   try {
-    if (!(await filePermission(false))) { fileState = 'locked'; return; }
-    fileLast = await writeDataTo(dirHandle); fileState = 'ok'; fileErr = '';
-  } catch (e) { console.error(e); fileState = 'error'; fileErr = e.message || String(e); }
+    if (!(await filePermission(false))) { fileState = 'locked'; flog('autorisation absente : enregistrement en attente'); return; }
+    fileLast = await writeDataTo(dirHandle); fileState = 'ok'; fileErr = ''; flog('budget.json enregistré');
+  } catch (e) { console.error(e); fileState = 'error'; fileErr = errTxt(e); flog('ÉCHEC : ' + fileErr); }
   finally { fileBusy = false; const el = $('#file-status'); if (el) el.innerHTML = fileStatusText(); }
 }
 function fileStatusText() {
@@ -1033,7 +1043,7 @@ function fileStatusText() {
   return `✅ Dossier « ${esc(dirHandle.name)} » : fichier ${FILE_NAME} ${fileLast ? 'enregistré le ' + new Date(fileLast).toLocaleString('fr-FR') : 'en attente du premier enregistrement'}.`;
 }
 async function fileInit() {
-  try { const rec = await dbGet('settings', 'dir'); if (rec && rec.handle) { dirHandle = rec.handle; fileState = (await filePermission(false)) ? 'ok' : 'locked'; } } catch (e) { console.warn(e); }
+  try { const rec = await dbGet('settings', 'dir'); if (rec && rec.handle) { dirHandle = rec.handle; fileState = (await filePermission(false)) ? 'ok' : 'locked'; flog('dossier « ' + dirHandle.name + ' » retrouvé au lancement, autorisation ' + (fileState === 'ok' ? 'active' : 'à redonner')); } else flog('aucun dossier mémorisé au lancement'); } catch (e) { console.warn(e); flog('lecture du dossier mémorisé impossible : ' + errTxt(e)); }
 }
 
 /* ---------- Installation PWA ---------- */
@@ -1100,15 +1110,31 @@ const A = {
   setTheme(v) { S.settings.theme = v; saveSettings(); applyTheme(); },
   setCycle(v) { S.settings.cycleDay = +v; saveSettings(); ui.month = curYm(); toast(+v === 1 ? 'Mois civil' : 'Mois budgétaire du ' + v + ' au ' + (v - 1)); render(); },
   async fileChoose() {
+    let h;
+    try { flog('ouverture du sélecteur de dossier'); h = await window.showDirectoryPicker({ mode: 'readwrite' }); }
+    catch (e) { flog('sélecteur fermé : ' + errTxt(e)); if (e.name !== 'AbortError') alert('Impossible d’ouvrir le sélecteur : ' + errTxt(e)); render(); return; }
+    flog('dossier choisi : « ' + h.name + ' »');
+    dirHandle = h; fileState = 'ok';
+    try { await dbPut('settings', { id: 'dir', handle: h }); flog('dossier mémorisé'); } catch (e) { flog('mémorisation impossible : ' + errTxt(e)); }
+    let existing = null; try { existing = await readDataFrom(h); flog('un fichier ' + FILE_NAME + ' existe déjà dans ce dossier'); } catch (e) { flog('pas de fichier existant (' + (e.name || 'vide') + ')'); }
     try {
-      const h = await window.showDirectoryPicker({ mode: 'readwrite', id: 'budget-hebdo' });
-      let existing = null; try { existing = await readDataFrom(h); } catch {}
-      dirHandle = h; await dbPut('settings', { id: 'dir', handle: h }); fileState = 'ok';
       if (existing && existing.data && existing.data.app === 'budget-hebdo' && confirm(`Ce dossier contient déjà un fichier ${FILE_NAME} (enregistré le ${new Date(existing.data.savedAt || existing.data.exportedAt).toLocaleString('fr-FR')}).\n\nOK = charger ces données dans l’application.\nAnnuler = les remplacer par les données actuelles de l’application.`)) {
-        await importData(existing.data, existing.getPhoto); applyTheme(); ui.month = curYm(); toast('Données chargées depuis le dossier');
-      } else { await fileSync(); toast(fileState === 'ok' ? 'Dossier prêt : données enregistrées' : 'Écriture impossible dans ce dossier'); }
-      render();
-    } catch (e) { if (e.name !== 'AbortError') { console.error(e); alert('Impossible d’utiliser ce dossier : ' + e.message); } }
+        await importData(existing.data, existing.getPhoto); applyTheme(); ui.month = curYm(); flog('données chargées depuis le dossier');
+      } else await fileSync();
+    } catch (e) { fileState = 'error'; fileErr = errTxt(e); flog('ÉCHEC : ' + fileErr); }
+    render();
+    alert(fileState === 'ok' ? `✅ Dossier « ${h.name} » prêt : le fichier ${FILE_NAME} y est enregistré.` : `⚠️ Écriture impossible dans « ${h.name} ».\n\n${fileErr || 'Autorisation refusée.'}\n\nEssaie un sous-dossier de Documents ou de Téléchargements.`);
+  },
+  async fileTest() {
+    if (!dirHandle) return;
+    try {
+      if (!(await filePermission(true))) { flog('test : autorisation refusée'); alert('Autorisation refusée par Chrome.'); render(); return; }
+      await writeFile(dirHandle, 'test-ecriture.txt', 'Budget Hebdo — test du ' + new Date().toLocaleString('fr-FR')); flog('test : fichier test-ecriture.txt écrit');
+      const txt = await (await (await dirHandle.getFileHandle('test-ecriture.txt')).getFile()).text(); flog('test : relecture OK (' + txt.length + ' caractères)');
+      fileState = 'ok'; await fileSync();
+      alert(fileState === 'ok' ? '✅ Test réussi : test-ecriture.txt et ' + FILE_NAME + ' sont écrits dans « ' + dirHandle.name + ' ».' : '⚠️ Le fichier de test passe, mais pas ' + FILE_NAME + ' :\n' + fileErr);
+    } catch (e) { fileState = 'error'; fileErr = errTxt(e); flog('test : ÉCHEC ' + fileErr); alert('⚠️ Test échoué :\n' + fileErr); }
+    render();
   },
   async fileUnlock() { try { if (await filePermission(true)) { fileState = 'ok'; await fileSync(); toast('Dossier réactivé'); } else toast('Autorisation refusée'); } catch (e) { alert(e.message); } render(); },
   async fileLoad() {
