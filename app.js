@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.9.0';
+const APP_VERSION = '2.10.0';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -541,7 +541,7 @@ function viewSettings() {
   h += `</div></div>`;
   h += `<div class="section"><h2>Options</h2><div class="list" style="padding:4px 14px">
     <label class="chk"><input type="checkbox" ${st.carryOver ? 'checked' : ''} onchange="A.setCarry(this.checked)"> Reporter le reste (ou le dépassement) sur la semaine suivante</label>
-    <label class="f"><span>Thème de l’affichage</span><select onchange="A.setTheme(this.value)">${[['dark','🌙 Sombre (recommandé)'],['light','☀️ Clair'],['auto','Automatique (comme le téléphone)']].map(([v,l])=>`<option value="${v}" ${(st.theme||'dark')===v?'selected':''}>${l}</option>`).join('')}</select></label>
+    <label class="f"><span>Thème de l’affichage</span><select onchange="A.setTheme(this.value)">${[['slate','🌊 Ardoise (gris et bleu)'],['dark','🌙 Nuit violette'],['light','☀️ Clair'],['auto','Automatique (comme le téléphone)']].map(([v,l])=>`<option value="${v}" ${(st.theme||'dark')===v?'selected':''}>${l}</option>`).join('')}</select></label>
     <label class="f"><span>Début du mois budgétaire</span><select onchange="A.setCycle(this.value)">${[1, ...Array.from({ length: 27 }, (_, i) => i + 2)].map(d => `<option value="${d}" ${cycleDay() === d ? 'selected' : ''}>${d === 1 ? 'Le 1er (mois civil)' : 'Le ' + d + ' du mois précédent'}</option>`).join('')}</select></label>
     <p class="help">Choisis le jour où arrive ton salaire : avec « le 25 », le budget de novembre va du 25 octobre au 24 novembre.</p>
     <label class="f"><span>Début du suivi (le budget est calculé à partir de cette date)</span><input type="date" value="${st.startDate}" onchange="A.setStart(this.value)"></label></div></div>`;
@@ -1444,7 +1444,7 @@ function applyTheme() {
   let t = (S.settings && S.settings.theme) || 'dark';
   if (t === 'auto') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   document.documentElement.dataset.theme = t;
-  const m = document.querySelector('meta[name=theme-color]'); if (m) m.content = t === 'light' ? '#f5f3fc' : '#140f2e';
+  const m = document.querySelector('meta[name=theme-color]'); if (m) m.content = t === 'light' ? '#f5f3fc' : t === 'slate' ? '#0F2428' : '#140f2e';
 }
 
 /* ---------- Démarrage ---------- */
