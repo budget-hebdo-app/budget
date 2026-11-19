@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.10.1';
+const APP_VERSION = '2.11.0';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -140,12 +140,37 @@ const cycleLabel = ym => cycleDay() === 1 ? '' : `du ${fshort(cycleStart(ym))} a
 const curYm = () => cycleOf(today());
 const startYm = () => cycleOf(S.settings.startDate);
 
+/* ---------- Contrats annuels (assurances…) ----------
+   t.contract = true, t.anniv = 'MM-JJ' (date anniversaire), t.rates = [{from: date du 1er prélèvement au tarif, amount}].
+   Le montant d'un mois budgétaire = dernier tarif dont le 1er prélèvement tombe dans ce mois ou avant. */
+const isContract = t => !!t && t.contract && !t.variable;
+function amountFor(t, ym) {
+  if (!isContract(t) || !(t.rates || []).length) return t.amount;
+  const r = [...t.rates].sort((a, b) => a.from.localeCompare(b.from)).filter(x => cycleOf(x.from) <= ym).pop();
+  return r ? r.amount : t.rates.slice().sort((a, b) => a.from.localeCompare(b.from))[0].amount;
+}
+/* Prochaine date anniversaire (encore « active » jusqu'à 30 jours après) */
+function nextAnniv(t, ref) {
+  if (!isContract(t) || !t.anniv) return null; ref = ref || today();
+  const mm = t.anniv.slice(0, 2), dd = +t.anniv.slice(3);
+  for (let y = +ref.slice(0, 4) - 1; y <= +ref.slice(0, 4) + 1; y++) { const d = y + '-' + mm + '-' + pad(Math.min(dd, daysInMonth(y + '-' + mm))); if (addDays(d, 30) >= ref) return d; }
+  return null;
+}
+/* Rappel : de 30 jours avant à 30 jours après la date anniversaire, si aucun tarif n'a été saisi pour cette échéance */
+function contractsDue() {
+  const T = today();
+  return S.chargeTypes.filter(t => t.active && isContract(t) && t.anniv).filter(t => {
+    const N = nextAnniv(t, T); if (!N || T < addDays(N, -30)) return false;
+    if ((t.annivAck || '') === N) return false;
+    return !(t.rates || []).some(r => r.from >= addDays(N, -90) && r.set);
+  });
+}
 /* Crée les lignes du mois (revenus fixes + charges) à partir des types, une seule fois par mois */
 function ensureMonth(ym) {
   if (ym < startYm()) return false;
   if (S.settings.months[ym]) return true;
   S.settings.months[ym] = true;
-  S.chargeTypes.filter(t => t.active && !t.variable && t.amount > 0).forEach(t => put('monthItems', { id: uid(), month: ym, kind: 'charge', typeId: t.id, name: t.name, amount: t.amount, date: cycleStart(ym), auto: true }));
+  S.chargeTypes.filter(t => t.active && !t.variable && amountFor(t, ym) > 0).forEach(t => put('monthItems', { id: uid(), month: ym, kind: 'charge', typeId: t.id, name: t.name, amount: amountFor(t, ym), date: cycleStart(ym), auto: true }));
   saveSettings();
   return true;
 }
@@ -160,7 +185,7 @@ function ensureIncome(t, K) {
   saveSettings();
 }
 /* Quand on modifie un type, on répercute sur le mois en cours et les suivants (lignes automatiques seulement) */
-function syncType(kind, t, deleted) {
+function syncType(kind, t, deleted, fromYm) {
   if (kind === 'income') {
     const p = incDay(t), K0 = pOf(today(), p);
     S.monthItems.filter(i => i.kind === 'income' && i.typeId === t.id && i.month >= K0).forEach(i => {
@@ -170,14 +195,14 @@ function syncType(kind, t, deleted) {
     for (let k = 0, K = K0; k < 36; k++, K = addMonths(K, 1)) flags[t.id + '|' + K] = false; // à recréer avec le nouveau montant
     saveSettings(); return;
   }
-  const cur = curYm();
+  const cur = fromYm && fromYm < curYm() ? fromYm : curYm();
   Object.keys(S.settings.months).filter(ym => ym >= cur).forEach(ym => {
     const items = S.monthItems.filter(i => i.month === ym && i.typeId === t.id);
     const autoIt = items.find(i => i.auto);
-    const wanted = !deleted && t.active && !t.variable && t.amount > 0;
+    const amt = amountFor(t, ym), wanted = !deleted && t.active && !t.variable && amt > 0;
     if (wanted) {
-      if (autoIt) put('monthItems', { ...autoIt, amount: t.amount, name: t.name });
-      else if (!items.length) put('monthItems', { id: uid(), month: ym, kind, typeId: t.id, name: t.name, amount: t.amount, date: cycleStart(ym), auto: true });
+      if (autoIt) put('monthItems', { ...autoIt, amount: amt, name: t.name });
+      else if (!items.length) put('monthItems', { id: uid(), month: ym, kind, typeId: t.id, name: t.name, amount: amt, date: cycleStart(ym), auto: true });
     } else if (autoIt) remove('monthItems', autoIt.id);
     items.filter(i => !i.auto && !deleted).forEach(i => { if (i.name !== t.name) put('monthItems', { ...i, name: t.name }); });
   });
@@ -298,7 +323,7 @@ function render() {
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === ui.tab));
   $('#fab').classList.toggle('hidden', ui.tab === 'settings');
   const v = $('#view');
-  v.innerHTML = ui.tab === 'week' ? viewWeek() : ui.tab === 'month' ? viewMonth() : viewSettings();
+  v.innerHTML = ui.tab === 'week' ? viewWeek() : ui.tab === 'month' ? viewMonth() : ui.tab === 'analysis' ? viewAnalysis() : viewSettings();
   loadThumbs(); prettySelects(v);
 }
 /* Listes déroulantes aux couleurs de l'app : la liste native du téléphone (grise) est remplacée
@@ -361,6 +386,7 @@ function banners() {
   h += syncBanner();
   if (!S.settings.driveAuto && !noIncome && S.expenses.length && (!lb || Date.now() - lb > 7 * 864e5)) h += `<div class="banner">☁️ ${lb ? 'Dernière sauvegarde il y a plus de 7 jours.' : 'Aucune sauvegarde pour l’instant.'} <br><button class="btn" onclick="A.backup()">Sauvegarder sur Google Drive</button></div>`;
   if (dirHandle && fileState === 'locked') h += `<div class="banner">🔒 L’enregistrement dans le dossier « ${esc(dirHandle.name)} » attend ton autorisation.<br><button class="btn" onclick="A.fileUnlock()">Réactiver</button></div>`;
+  contractsDue().forEach(t => { const N = nextAnniv(t); h += `<div class="banner">📑 <b>${esc(t.name)}</b> : échéance annuelle le ${fshort(N)}. Le tarif change-t-il (bonus, malus, révision) ?<div class="btns"><button class="btn" onclick="A.contractRate('${t.id}')">Nouveau tarif</button><button class="btn ghost" onclick="A.contractSame('${t.id}')">Montant inchangé</button></div></div>`; });
   const bp = billsPending(curYm());
   if (bp.length) h += `<div class="banner">🧾 Facture${bp.length > 1 ? 's' : ''} attendue${bp.length > 1 ? 's' : ''} pour ce mois : <b>${bp.map(t => esc(t.name)).join(', ')}</b>${bp.some(t => t.amount > 0) ? ' (montant habituel compté en attendant)' : ''}.<br><button class="btn" onclick="A.addBill('${curYm()}','${bp[0].id}')">Saisir la facture</button></div>`;
   const pend = pendingVariable(curYm());
@@ -526,8 +552,8 @@ function viewSettings() {
   h += `<div class="section"><h2>Types de revenus <button onclick="A.incomeType()">+ Ajouter</button></h2><div class="list">`;
   S.incomeTypes.forEach(t => h += `<div class="row" onclick="A.incomeType('${t.id}')"><span class="ico">💶</span><div class="mid"><div>${esc(t.name)}${t.active ? '' : ' (inactif)'}</div><small>${t.variable ? (t.estimate ? 'Variable · estimation comptée' : 'Variable · compté à réception') : 'Fixe'} · ${isSliding(t) ? '1 mois à partir de la date saisie' : incDay(t) === 1 ? 'du 1er à la fin du mois' : 'du ' + incDay(t) + ' au ' + (incDay(t) - 1)}</small></div><div class="amt">${t.variable ? (t.amount ? '≈ ' + fmt(t.amount) : '—') : fmt(t.amount)}</div></div>`);
   h += `</div></div><div class="section"><h2>Charges <button onclick="A.chargeType()">+ Ajouter</button></h2><div class="list">`;
-  S.chargeTypes.forEach(t => h += `<div class="row" onclick="A.chargeType('${t.id}')"><span class="ico" style="--h:20">${t.variable ? '🧾' : '📄'}</span><div class="mid"><div>${esc(t.name)}${t.active ? '' : ' (inactif)'}</div><small>${t.variable ? 'Variable · facture saisie au prélèvement' : 'Fixe'}</small></div><div class="amt">${t.variable ? (t.amount ? '≈ ' + fmt(t.amount) : '—') : fmt(t.amount)}</div></div>`);
-  const tI = S.incomeTypes.filter(t => t.active && !t.variable).reduce((s, t) => s + t.amount, 0), tC = S.chargeTypes.filter(t => t.active).reduce((s, t) => s + t.amount, 0);
+  S.chargeTypes.forEach(t => h += `<div class="row" onclick="A.chargeType('${t.id}')"><span class="ico" style="--h:20">${t.variable ? '🧾' : '📄'}</span><div class="mid"><div>${esc(t.name)}${t.active ? '' : ' (inactif)'}</div><small>${t.variable ? 'Variable · facture saisie au prélèvement' : isContract(t) && t.anniv ? 'Contrat annuel · échéance le ' + fshort(nextAnniv(t)) : 'Fixe'}</small></div><div class="amt">${t.variable ? (t.amount ? '≈ ' + fmt(t.amount) : '—') : fmt(amountFor(t, curYm()))}</div></div>`);
+  const tI = S.incomeTypes.filter(t => t.active && !t.variable).reduce((s, t) => s + t.amount, 0), tC = S.chargeTypes.filter(t => t.active).reduce((s, t) => s + amountFor(t, curYm()), 0);
   const tV = S.incomeTypes.filter(t => t.active && t.variable).reduce((s, t) => s + (t.amount || 0), 0);
   h += `<div class="row total-row"><span class="ico">=</span><div class="mid"><div>Solde mensuel de base</div><small>revenus fixes − charges</small></div><div class="amt ${tI - tC < 0 ? 'neg' : 'pos'}">${fmt(tI - tC)}</div></div>`;
   if (tV) h += `<div class="row total-row"><span class="ico">≈</span><div class="mid"><div>Avec les revenus variables</div><small>en comptant leurs montants habituels</small></div><div class="amt ${tI + tV - tC < 0 ? 'neg' : 'pos'}">${fmt(tI + tV - tC)}</div></div>`;
@@ -565,6 +591,130 @@ function viewSettings() {
     <div class="btns"><button class="btn ghost" onclick="A.exportFile()">Exporter</button><label class="btn ghost">Importer<input type="file" accept="application/json,.json" hidden onchange="A.importFile(this.files[0])"></label></div></div></div>`;
   h += `<div class="section">${deferredInstall ? `<button class="btn block" onclick="A.install()">📲 Installer l’application</button>` : ''}<button class="btn ghost block" onclick="A.checkUpdate()">🔄 Vérifier les mises à jour</button><p class="help" style="text-align:center">Budget Hebdo v${APP_VERSION} · ${S.expenses.length} dépenses enregistrées</p></div>`;
   return h;
+}
+
+/* ---------- Analyse : graphiques et exports ----------
+   Couleurs des catégories : palette catégorielle validée (contraste ≥ 3:1 sur les cartes sombres, séparation daltoniens),
+   attribuée dans l'ordre FIXE des catégories (une catégorie garde sa couleur), « Autres » en gris au-delà de 8. */
+const PAL_DARK = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#0ca30c', '#9085e9', '#e66767'];
+const PAL_LIGHT = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
+const palette = () => document.documentElement.dataset.theme === 'light' ? PAL_LIGHT : PAL_DARK;
+const catColor = id => { const i = S.categories.findIndex(c => c.id === id); return i >= 0 && i < 8 ? palette()[i] : '#8a9a9e'; };
+const SER = { avail: () => palette()[0], spent: () => palette()[1] }; // disponible = bleu, dépensé = orange
+ui.ana = { p: 'month', ym: null, from: null, to: null };
+const PERIODS = [['month', 'Mois'], ['3m', '3 mois'], ['year', '12 mois'], ['custom', 'Dates libres']];
+function anaRange(a) {
+  a = a || ui.ana; const ym = a.ym || curYm();
+  if (a.p === 'custom') { const A = a.from || cycleStart(ym), B = a.to || today(); return { A, B, months: monthsBetween(cycleOf(A), cycleOf(B)), label: `du ${fdate(A, { day: 'numeric', month: 'short', year: 'numeric' })} au ${fdate(B, { day: 'numeric', month: 'short', year: 'numeric' })}` }; }
+  const n = { month: 1, '3m': 3, year: 12 }[a.p], y0 = addMonths(ym, -(n - 1));
+  return { A: cycleStart(y0), B: cycleEnd(ym), months: monthsBetween(y0, ym), label: n === 1 ? fmonth(ym) + (cycleDay() > 1 ? ' · ' + cycleLabel(ym) : '') : `${fmonth(y0)} → ${fmonth(ym)}` };
+}
+function monthsBetween(a, b) { const out = []; for (let m = a; m <= b && out.length < 60; m = addMonths(m, 1)) out.push(m); return out; }
+function prevRange(r) {
+  if (ui.ana.p === 'custom') { const len = Math.round((parseD(r.B) - parseD(r.A)) / 864e5) + 1; return anaRange({ p: 'custom', from: addDays(r.A, -len), to: addDays(r.A, -1) }); }
+  const n = r.months.length; return anaRange({ p: ui.ana.p, ym: addMonths(r.months[n - 1], -n) });
+}
+/* Toutes les données d'une période (dépenses depuis le début du suivi uniquement) */
+function anaData(r) {
+  const A = r.A > S.settings.startDate ? r.A : S.settings.startDate, B = r.B;
+  const exps = S.expenses.filter(e => e.date >= A && e.date <= B);
+  const spent = exps.reduce((s, e) => s + e.amount, 0);
+  const byCat = {}; exps.forEach(e => byCat[e.categoryId] = (byCat[e.categoryId] || 0) + e.amount);
+  const shops = {}; exps.forEach(e => { const label = (e.note || catOf(e.categoryId).name).trim(); const k = compact(label) || label; const o = shops[k] = shops[k] || { label, n: 0, v: 0, cat: e.categoryId }; o.n++; o.v += e.amount; });
+  const months = r.months.filter(ym => ym >= startYm()).map(ym => {
+    let rev = 0, ch = 0, sav = 0, sp = 0;
+    for (let d = cycleStart(ym); d <= cycleEnd(ym); d = addDays(d, 1)) { if (d < S.settings.startDate) continue; const k = dayIdx(d, ym); rev += incomeOn(d); ch -= chargeDaily(ym)[k]; sav -= savingDaily(ym)[k]; sp += spentOn(d); }
+    return { ym, rev, ch, sav, avail: rev - ch - sav, spent: sp };
+  });
+  const end = B < today() ? B : today(), days = A > end ? 0 : Math.round((parseD(end) - parseD(A)) / 864e5) + 1;
+  return { A, B, exps, spent, byCat, shops: Object.values(shops).sort((a, b) => b.v - a.v), months, days };
+}
+/* Petits outils SVG */
+const svgEsc = esc;
+function barPath(x, y, w, h, r) { if (h <= 0) return ''; r = Math.min(r, w / 2, h); return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`; }
+function donut(parts, total) {
+  const R = 62, W = 24, C = 2 * Math.PI * R; let off = 0, h = '';
+  parts.forEach((p, i) => { const len = p.v / total * C, gap = parts.length > 1 ? Math.min(2, len / 2) : 0;
+    h += `<circle class="mk" data-tip="${svgEsc(p.label)} : ${fmt(p.v)} (${Math.round(p.v / total * 100)} %)" cx="80" cy="80" r="${R}" fill="none" stroke="${p.color}" stroke-width="${W}" stroke-dasharray="${Math.max(0.1, len - gap)} ${C}" stroke-dashoffset="${-off}" transform="rotate(-90 80 80)"/>`; off += len; });
+  return `<svg viewBox="0 0 160 160" class="donut" role="img" aria-label="Répartition des dépenses par catégorie">${h}<text x="80" y="76" text-anchor="middle" class="d-lbl">Total</text><text x="80" y="96" text-anchor="middle" class="d-val">${fmt(total)}</text></svg>`;
+}
+/* Barres groupées : 2 séries (disponible / dépensé), une seule échelle */
+function bars(groups, aria) {
+  const W = 320, H = 170, top = 10, bottom = 24, left = 4, right = 4, ih = H - top - bottom;
+  const max = Math.max(1, ...groups.flatMap(g => [g.a, g.b]));
+  const gw = (W - left - right) / groups.length, bw = Math.max(3, Math.min(16, gw * 0.32));
+  let h = `<line x1="${left}" x2="${W - right}" y1="${top + ih}" y2="${top + ih}" class="axis"/>`;
+  [0.5, 1].forEach(f => h += `<line x1="${left}" x2="${W - right}" y1="${top + ih * (1 - f)}" y2="${top + ih * (1 - f)}" class="grid"/>`);
+  groups.forEach((g, i) => {
+    const cx = left + gw * i + gw / 2, ha = Math.max(0, g.a) / max * ih, hb = Math.max(0, g.b) / max * ih;
+    h += `<rect class="hit" x="${left + gw * i}" y="${top}" width="${gw}" height="${ih + bottom}" data-tip="${svgEsc(g.tip)}"/>`;
+    h += `<path d="${barPath(cx - bw - 1, top + ih - ha, bw, ha, 4)}" fill="${SER.avail()}" pointer-events="none"/>`;
+    h += `<path d="${barPath(cx + 1, top + ih - hb, bw, hb, 4)}" fill="${SER.spent()}" pointer-events="none"/>`;
+    if (groups.length <= 14 || i % 2 === 0) h += `<text x="${cx}" y="${H - 7}" text-anchor="middle" class="x-lbl">${svgEsc(g.x)}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" class="bars" role="img" aria-label="${svgEsc(aria)}">${h}</svg>`;
+}
+const legend2 = (a, b) => `<div class="legend"><span><i style="background:${SER.avail()}"></i>${a}</span><span><i style="background:${SER.spent()}"></i>${b}</span></div>`;
+const pctTxt = (v, ref) => !ref ? '' : (v >= ref ? '+' : '−') + Math.abs(Math.round((v - ref) / ref * 100)) + ' %';
+
+function viewAnalysis() {
+  const r = anaRange(), d = anaData(r), pr = prevRange(r), dp = anaData(pr);
+  let h = `<header class="topbar">${ui.ana.p !== 'custom' ? `<button class="nav-btn noprint" onclick="A.anaMove(-1)">‹</button>` : '<span class="nav-spacer"></span>'}<div class="tb-mid"><div class="wk-title">Analyse</div><div class="wk-sub cap">${esc(r.label)}</div></div>${ui.ana.p !== 'custom' ? `<button class="nav-btn noprint" onclick="A.anaMove(1)">›</button>` : '<span class="nav-spacer"></span>'}</header>
+    <div class="print-head"><b>Budget Hebdo — Analyse</b><br>${esc(r.label)} · édité le ${fdate(today(), { day: 'numeric', month: 'long', year: 'numeric' })}</div>
+    <div class="seg noprint">${PERIODS.map(([k, l]) => `<button class="${ui.ana.p === k ? 'on' : ''}" onclick="A.anaPeriod('${k}')">${l}</button>`).join('')}</div>`;
+  if (ui.ana.p === 'custom') h += `<div class="section noprint"><div class="list" style="padding:4px 14px"><div class="two"><label class="f"><span>Du</span><input type="date" value="${r.A}" onchange="A.anaDates(this.value,null)"></label><label class="f"><span>Au</span><input type="date" value="${r.B}" onchange="A.anaDates(null,this.value)"></label></div></div></div>`;
+  if (r.B < S.settings.startDate) return h + `<div class="section"><div class="empty">Cette période est avant le début du suivi (${fshort(S.settings.startDate)}).</div></div>`;
+  // Chiffres clés
+  const perWeek = d.days ? d.spent / d.days * 7 : 0, sav = d.months.reduce((s, m) => s + m.sav, 0), avail = d.months.reduce((s, m) => s + m.avail, 0);
+  const inc = S.categories.map(c => ({ c, v: (d.byCat[c.id] || 0) - (dp.byCat[c.id] || 0) })).filter(x => dp.spent && x.v > 0).sort((a, b) => b.v - a.v)[0];
+  h += `<div class="kpis">
+    <div class="kpi"><small>Dépensé</small><b>${fmt(d.spent)}</b><em>${dp.spent ? pctTxt(d.spent, dp.spent) + ' vs période précédente' : '&nbsp;'}</em></div>
+    <div class="kpi"><small>Moyenne / semaine</small><b>${fmt(perWeek)}</b><em>${d.days ? '≈ ' + fmt(d.spent / d.days) + ' par jour' : '&nbsp;'}</em></div>
+    <div class="kpi"><small>Disponible (mois)</small><b>${fmt(avail)}</b><em>${r.months.length > 1 || ui.ana.p === 'custom' ? 'mois budgétaires entiers' : 'revenus − charges − épargne'}</em></div>
+    <div class="kpi"><small>Épargne réelle</small><b class="${sav < 0 ? 'neg' : 'pos'}">${fmt(sav)}</b><em>${inc ? '↑ ' + esc(inc.c.name) + ' +' + fmt(inc.v) : '&nbsp;'}</em></div></div>`;
+  // Camembert par catégorie
+  h += `<div class="section"><h2>Dépenses par catégorie</h2>`;
+  if (!d.spent) h += `<div class="empty">Aucune dépense sur cette période.</div>`;
+  else {
+    const cats = Object.entries(d.byCat).map(([id, v]) => ({ id, v, label: catOf(id).name, icon: catOf(id).icon, color: catColor(id), idx: S.categories.findIndex(c => c.id === id) }));
+    const main = cats.filter(c => c.idx >= 0 && c.idx < 8).sort((a, b) => a.idx - b.idx), other = cats.filter(c => !(c.idx >= 0 && c.idx < 8));
+    if (other.length) main.push({ id: 'other', v: other.reduce((s, c) => s + c.v, 0), label: 'Autres', icon: '•', color: '#8a9a9e' });
+    const sorted = main.slice().sort((a, b) => b.v - a.v);
+    h += `<div class="chart-card">${donut(main, d.spent)}<div class="tip" aria-live="polite">Touche une part pour voir le détail</div>
+      <div class="list">${sorted.map(c => `<div class="row"><span class="sw" style="background:${c.color}"></span><div class="mid"><div>${c.icon || ''} ${esc(c.label)}</div><small>${Math.round(c.v / d.spent * 100)} %${dp.byCat[c.id] ? ' · ' + pctTxt(c.v, dp.byCat[c.id]) + ' vs précédente' : ''}</small></div><div class="amt">${fmt(c.v)}</div></div>`).join('')}</div></div>`;
+  }
+  h += `</div>`;
+  // Barres par semaine (périodes courtes) — budget de la semaine sans report
+  const span = Math.round((parseD(d.B) - parseD(d.A)) / 864e5) + 1;
+  if (span <= 100 && d.A <= d.B) {
+    const groups = [];
+    for (let m = mondayOf(d.A); m <= d.B; m = addDays(m, 7)) { let b = 0, s = 0; for (let i = 0; i < 7; i++) { const x = addDays(m, i); if (x < d.A || x > d.B) continue; b += dayBudget(x); s += spentOn(x); } const w = isoWeek(m).w; groups.push({ x: 'S' + w, a: b, b: s, tip: `S${w} (${fshort(m)} → ${fshort(addDays(m, 6))}) : budget ${fmt(b)} · dépensé ${fmt(s)}${s > b ? ' · dépassé de ' + fmt(s - b) : ''}` }); }
+    h += `<div class="section"><h2>Budget et dépenses par semaine</h2><div class="chart-card">${legend2('Budget de la semaine', 'Dépensé')}${bars(groups, 'Budget et dépenses par semaine')}<div class="tip" aria-live="polite">Touche une semaine pour voir le détail</div><p class="help">Budget de la semaine sans le report des semaines précédentes.</p></div></div>`;
+  }
+  // Barres par mois
+  if (d.months.length) {
+    const groups = d.months.map(m => ({ x: fdate(m.ym + '-01', { month: 'short' }).replace('.', ''), a: m.avail, b: m.spent, tip: `${fmonth(m.ym)} : disponible ${fmt(m.avail)} · dépensé ${fmt(m.spent)} · reste ${fmt(m.avail - m.spent)}` }));
+    h += `<div class="section"><h2>Mois par mois</h2><div class="chart-card">${d.months.length > 1 ? legend2('Disponible', 'Dépensé') + bars(groups, 'Disponible et dépensé par mois') + '<div class="tip" aria-live="polite">Touche un mois pour voir le détail</div>' : ''}
+      <div class="tbl-wrap"><table class="weeks ana-tbl"><tr><th>Mois</th><th>Revenus</th><th>Charges</th><th>Épargne</th><th>Dépensé</th><th>Reste</th></tr>${d.months.map(m => `<tr><td class="cap"><b>${fdate(m.ym + '-01', { month: 'short', year: '2-digit' })}</b></td><td>${fmt(m.rev)}</td><td>${fmt(m.ch)}</td><td>${fmt(m.sav)}</td><td>${fmt(m.spent)}</td><td class="${m.avail - m.spent < 0 ? 'neg' : 'pos'}"><b>${fmt(m.avail - m.spent)}</b></td></tr>`).join('')}</table></div></div></div>`;
+  }
+  // Commerçants
+  if (d.shops.length) h += `<div class="section"><h2>Où part l’argent</h2><div class="list">${d.shops.slice(0, 8).map((o, i) => `<div class="row"><span class="ico">${i + 1}</span><div class="mid"><div>${esc(o.label)}</div><small>${o.n} achat${o.n > 1 ? 's' : ''} · ${esc(catOf(o.cat).name)} · ${Math.round(o.v / d.spent * 100)} %</small></div><div class="amt">${fmt(o.v)}</div></div>`).join('')}</div></div>`;
+  h += `<div class="section noprint"><h2>Exporter</h2><div class="btns"><button class="btn" onclick="A.anaPdf()">📄 Rapport PDF</button><button class="btn ghost" onclick="A.anaCsv()">📊 Fichier CSV</button></div><p class="help">PDF : choisis « Enregistrer au format PDF » comme imprimante. CSV : s’ouvre dans Excel ou Google Sheets (liste des dépenses + récapitulatif par mois).</p></div>`;
+  return h;
+}
+/* Toucher un élément d'un graphique : son détail s'affiche sous le graphique */
+document.addEventListener('click', e => { const m = e.target.closest && e.target.closest('[data-tip]'); if (!m) return; const card = m.closest('.chart-card'); if (!card) return; card.querySelectorAll('.sel').forEach(x => x.classList.remove('sel')); m.classList.add('sel'); const t = card.querySelector('.tip'); if (t) t.textContent = m.dataset.tip; });
+function csvExport() {
+  const r = anaRange(), d = anaData(r), q = v => { v = String(v ?? ''); return /[;"\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  const L = [['Budget Hebdo — export', r.label], [], ['Dépenses'], ['Date', 'Montant (F CFP)', 'Catégorie', 'Description', 'Photo']];
+  d.exps.slice().sort((a, b) => a.date.localeCompare(b.date)).forEach(e => L.push([e.date.split('-').reverse().join('/'), e.amount, catOf(e.categoryId).name, e.note || '', e.photoId ? 'oui' : '']));
+  L.push(['Total', d.spent], [], ['Par catégorie'], ['Catégorie', 'Montant (F CFP)', 'Part (%)']);
+  Object.entries(d.byCat).sort((a, b) => b[1] - a[1]).forEach(([id, v]) => L.push([catOf(id).name, v, Math.round(v / d.spent * 100)]));
+  L.push([], ['Récapitulatif par mois budgétaire'], ['Mois', 'Période', 'Revenus', 'Charges', 'Épargne nette', 'Disponible', 'Dépensé', 'Reste']);
+  d.months.forEach(m => L.push([fmonth(m.ym), cycleStart(m.ym).split('-').reverse().join('/') + ' – ' + cycleEnd(m.ym).split('-').reverse().join('/'), m.rev, m.ch, m.sav, m.avail, m.spent, m.avail - m.spent]));
+  const txt = '﻿' + L.map(row => row.map(q).join(';')).join('\r\n');
+  const name = `budget-hebdo-${d.A}-au-${d.B}.csv`, file = new Blob([txt], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; a.click(); toast('Fichier ' + name + ' enregistré dans Téléchargements', 4000);
 }
 
 /* ---------- Feuille modale ---------- */
@@ -1301,14 +1451,55 @@ const A = {
       id ? () => { syncType('income', t, true); remove('incomeTypes', id); } : null);
   },
   chargeType(id) {
-    const t = id ? S.chargeTypes.find(x => x.id === id) : { id: uid(), name: '', amount: 0, active: true };
-    form(id ? 'Modifier la charge' : 'Nouvelle charge fixe', [
+    const t0 = id ? S.chargeTypes.find(x => x.id === id) : { id: uid(), name: '', amount: 0, active: true };
+    const t = { ...t0, amount: isContract(t0) ? amountFor(t0, curYm()) : t0.amount, annivDate: t0.anniv ? (nextAnniv(t0) || '') : '' };
+    form(id ? 'Modifier la charge' : 'Nouvelle charge', [
       { k: 'name', l: 'Nom', ph: 'ex. Loyer' },
       { k: 'variable', l: 'Montant variable (facture selon la consommation : électricité, téléphone…)', t: 'chk', help: 'Variable : chaque mois, tu saisis la facture avec sa date de prélèvement (bouton + › Une facture). En attendant, le montant habituel ci-dessous est compté.' },
-      { k: 'amount', l: 'Montant mensuel (fixe) ou montant habituel (variable)', t: 'money' }, { k: 'active', l: 'Active', t: 'chk' }], t,
-      v => { if (!v.name) { toast('Nom requis'); return false; } const n = { ...t, ...v }; put('chargeTypes', n); syncType('charge', n); },
+      { k: 'amount', l: 'Montant mensuel (fixe) ou montant habituel (variable)', t: 'money' },
+      { k: 'contract', l: 'Contrat révisé chaque année (assurance…)', t: 'chk', help: 'Un mois avant la date anniversaire, l’accueil te demande si le tarif change (bonus, malus, révision).' },
+      { k: 'annivDate', l: 'Date anniversaire du contrat (si contrat annuel)', t: 'date', help: isContract(t0) ? `<button type="button" class="btn ghost block" onclick="A.contractRate('${t0.id}')">📑 Nouveau tarif et historique</button>` : '' },
+      { k: 'active', l: 'Active', t: 'chk' }], t,
+      v => {
+        if (!v.name) { toast('Nom requis'); return false; }
+        if (v.contract && !v.variable && !v.annivDate) { toast('Indique la date anniversaire du contrat'); return false; }
+        const n = { ...t0, name: v.name, variable: v.variable, active: v.active, contract: v.contract && !v.variable, amount: v.amount };
+        delete n.annivDate;
+        if (n.contract) {
+          n.anniv = v.annivDate.slice(5);
+          n.rates = (t0.rates || []).slice();
+          if (!n.rates.length) n.rates.push({ from: cycleStart(curYm()), amount: v.amount });
+          else { const cur = n.rates.slice().sort((a, b) => a.from.localeCompare(b.from)).filter(x => cycleOf(x.from) <= curYm()).pop() || n.rates[0]; cur.amount = v.amount; }
+        }
+        put('chargeTypes', n); syncType('charge', n);
+      },
       id ? () => { syncType('charge', t, true); remove('chargeTypes', id); } : null);
   },
+  contractRate(id) {
+    const t = S.chargeTypes.find(x => x.id === id); if (!t) return;
+    const N = nextAnniv(t) || today();
+    const hist = (t.rates || []).slice().sort((a, b) => a.from.localeCompare(b.from));
+    let hh = '<div class="list" style="margin:6px 0 4px">';
+    hist.forEach((r, i) => { const prev = hist[i - 1]; const pct = prev && prev.amount ? Math.round((r.amount - prev.amount) / prev.amount * 1000) / 10 : null;
+      hh += `<div class="row"><span class="ico">📑</span><div class="mid"><div>${fmt(r.amount)} / mois</div><small>à partir du ${fdate(r.from, { day: 'numeric', month: 'short', year: 'numeric' })}</small></div><div class="amt ${pct > 0 ? 'neg' : pct < 0 ? 'pos' : ''}">${pct === null ? '' : (pct > 0 ? '+' : '') + String(pct).replace('.', ',') + ' %'}</div></div>`; });
+    hh += '</div>';
+    form('Nouveau tarif — ' + t.name, [
+      { k: 'amount', l: 'Nouveau montant mensuel (F CFP)', t: 'money' },
+      { k: 'from', l: 'Date du premier prélèvement au nouveau tarif', t: 'date', help: 'Le nouveau montant s’applique à partir du mois budgétaire de ce prélèvement ; les mois d’avant gardent l’ancien. Historique :' + hh }],
+      { amount: amountFor(t, cycleOf(N)), from: N },
+      v => {
+        if (v.amount <= 0) { toast('Indique un montant'); return false; }
+        const from = v.from || N, rates = (t.rates || []).filter(r => cycleOf(r.from) !== cycleOf(from)); rates.push({ from, amount: v.amount, set: true });
+        const n = { ...t, rates }; put('chargeTypes', n); syncType('charge', n, false, cycleOf(from));
+        toast(`Nouveau tarif appliqué à partir du budget de ${fdate(cycleOf(from) + '-01', { month: 'long', year: 'numeric' })}`);
+      });
+  },
+  anaPeriod(p) { ui.ana.p = p; if (p === 'custom' && !ui.ana.from) { const r = anaRange({ p: 'month', ym: ui.ana.ym }); ui.ana.from = r.A; ui.ana.to = today() < r.B ? today() : r.B; } render(); },
+  anaMove(n) { ui.ana.ym = addMonths(ui.ana.ym || curYm(), n * ({ month: 1, '3m': 3, year: 12 }[ui.ana.p] || 1)); render(); },
+  anaDates(a, b) { if (a) ui.ana.from = a; if (b) ui.ana.to = b; if (ui.ana.from > ui.ana.to) [ui.ana.from, ui.ana.to] = [ui.ana.to, ui.ana.from]; render(); },
+  anaCsv() { try { csvExport(); } catch (e) { alert('Export impossible : ' + e.message); } },
+  anaPdf() { document.title = 'Budget Hebdo - Analyse ' + anaRange().label; setTimeout(() => { window.print(); setTimeout(() => document.title = 'Budget Hebdo', 1500); }, 50); },
+  contractSame(id) { const t = S.chargeTypes.find(x => x.id === id); if (!t) return; put('chargeTypes', { ...t, annivAck: nextAnniv(t) }); toast('Noté : tarif inchangé cette année'); render(); },
   category(id) {
     const c = id ? S.categories.find(x => x.id === id) : { id: uid(), name: '', icon: '🏷️', keywords: '' };
     form(id ? 'Modifier la catégorie' : 'Nouvelle catégorie', [
