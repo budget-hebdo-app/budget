@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.8.0';
+const APP_VERSION = '2.9.0';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -340,7 +340,7 @@ function accountState() {
   }
   // factures (charges variables) : déduites le jour du prélèvement
   const bills = S.monthItems.filter(i => i.kind === 'charge' && i.bill && i.date > D && i.date <= T).sort((x, y) => x.date.localeCompare(y.date));
-  bills.forEach(i => charges.push({ bill: true, name: i.name, date: i.date, amount: i.amount }));
+  bills.forEach(i => charges.push({ bill: true, plan: i.plan, name: i.name, date: i.date, amount: i.amount }));
   for (let ym = cycleOf(D); cycleStart(ym) <= T; ym = addMonths(ym, 1)) ensureSaving(ym);
   const savings = S.monthItems.filter(i => i.kind === 'saving' && i.date > D && i.date <= T).sort((x, y) => x.date.localeCompare(y.date));
   const tS = savings.reduce((s, i) => s + savSign(i) * i.amount, 0);
@@ -490,7 +490,7 @@ function viewMonth() {
   h += `</div></div><div class="section"><h2>Charges <button onclick="A.chargeMenu('${ym}')">+ Ajouter</button></h2><div class="list">`;
   ch.sort((a, b) => b.amount - a.amount).forEach(i => h += i.estimate
     ? `<div class="row" onclick="A.addBill('${ym}','${i.typeId}')"><span class="ico" style="--h:20">⏳</span><div class="mid"><div>${esc(i.name)} (estimation)</div><small class="pending">Facture pas encore saisie — touche pour la saisir</small></div><div class="amt neg">≈ −${fmt(i.amount)}</div></div>`
-    : `<div class="row" onclick="A.editItem('${i.id}')"><span class="ico" style="--h:20">${i.bill ? '🧾' : '📄'}</span><div class="mid"><div>${esc(i.name)}</div>${i.bill ? `<small>facture prélevée le ${fshort(i.date)}</small>` : ''}</div><div class="amt neg">−${fmt(i.amount)}</div></div>`);
+    : `<div class="row" onclick="A.editItem('${i.id}')"><span class="ico" style="--h:20">${i.plan ? '📆' : i.bill ? '🧾' : '📄'}</span><div class="mid"><div>${esc(i.name)}</div>${i.bill ? `<small>${i.plan ? 'échéance' : 'facture'} prélevée le ${fshort(i.date)}</small>` : ''}</div><div class="amt neg">−${fmt(i.amount)}</div></div>`);
   billsPending(ym).filter(t => !(t.amount > 0)).forEach(t => h += `<div class="row" onclick="A.addBill('${ym}','${t.id}')"><span class="ico" style="--h:20">⏳</span><div class="mid"><div>${esc(t.name)}</div><small class="pending">En attente — touche pour saisir la facture</small></div><div class="amt">—</div></div>`);
   if (!ch.length) h += `<div class="empty">Aucune charge fixe ce mois-ci.</div>`;
   h += `</div></div>`;
@@ -1239,9 +1239,9 @@ const A = {
       v => { if (v.amount <= 0) { toast('Indique un montant'); return false; } const dt = v.date || today(); put('monthItems', { id: uid(), month: cycleOf(dt), kind: 'saving', sav, name: v.name || k.label, amount: v.amount, date: dt, auto: false }); toast(sav === 'back' ? 'Retour d’épargne ajouté, semaines recalculées' : 'Épargne ajoutée, semaines recalculées'); });
   },
   chargeMenu(ym) {
-    if (!S.chargeTypes.some(t => t.active && t.variable)) return A.addCharge(ym);
     sheet(`<h3>Charges</h3><div class="choice">
-      <button class="choice-btn" onclick="A.addBill('${ym}')"><span>🧾</span><b>Une facture</b><small>électricité, téléphone… avec sa date de prélèvement</small></button>
+      ${S.chargeTypes.some(t => t.active && t.variable) ? `<button class="choice-btn" onclick="A.addBill('${ym}')"><span>🧾</span><b>Une facture</b><small>électricité, téléphone… avec sa date de prélèvement</small></button>` : ''}
+      <button class="choice-btn" onclick="A.addPlan('${ym}')"><span>📆</span><b>Un échéancier</b><small>grosse facture payée en plusieurs mois</small></button>
       <button class="choice-btn" onclick="A.addCharge('${ym}')"><span>📄</span><b>Une charge ponctuelle</b><small>dépense exceptionnelle sur ce mois</small></button></div>`);
   },
   addBill(ym, typeId) {
@@ -1255,6 +1255,22 @@ const A = {
       v => { if (v.amount <= 0) { toast('Indique un montant'); return false; } const t = S.chargeTypes.find(x => x.id === v.typeId); const dt = v.date || today(); const K = cycleOf(dt);
         if (K < startYm()) { toast('Prélèvement avant le début du suivi : non compté'); }
         put('monthItems', { id: uid(), month: K, kind: 'charge', bill: true, typeId: t.id, name: t.name, amount: v.amount, date: dt, auto: false }); toast('Facture enregistrée : budget de ' + fdate(K + '-01', { month: 'long' }) + ' recalculé'); });
+  },
+  /* Échéancier : une charge exceptionnelle payée en N prélèvements mensuels ; chaque échéance compte dans le mois budgétaire de son prélèvement */
+  addPlan(ym) {
+    form('Échéancier', [
+      { k: 'name', l: 'Libellé', ph: 'ex. Facture d’eau (fuite)' },
+      { k: 'total', l: 'Montant total à payer (F CFP)', t: 'money' },
+      { k: 'n', l: 'Nombre de mensualités', t: 'select', o: Array.from({ length: 35 }, (_, i) => ({ v: String(i + 2), l: (i + 2) + ' mois' })) },
+      { k: 'date', l: 'Date du premier prélèvement', t: 'date', help: 'Les échéances suivantes sont prélevées le même jour les mois suivants. Le total est partagé en parts égales ; si ton échéancier prévoit des montants différents, touche ensuite l’échéance concernée dans l’onglet Mois pour la corriger.' }],
+      { n: '3', date: ym && ym !== curYm() ? cycleStart(ym) : today() },
+      v => {
+        const n = +v.n, d = v.date || today();
+        if (!v.name || v.total <= 0) { toast('Libellé et montant requis'); return false; }
+        const base = Math.floor(v.total / n), first = v.total - base * (n - 1), plan = uid();
+        for (let k = 0; k < n; k++) { const dt = addMonthDate(d, k); put('monthItems', { id: uid(), month: cycleOf(dt), kind: 'charge', bill: true, plan, planN: k + 1, planOf: n, typeId: null, name: `${v.name} (${k + 1}/${n})`, amount: k ? base : first, date: dt, auto: false }); }
+        toast(`Échéancier créé : ${n} prélèvements, du ${fshort(d)} au ${fshort(addMonthDate(d, n - 1))}`);
+      });
   },
   addCharge(ym) {
     form('Charge — ' + fmonth(ym), [{ k: 'name', l: 'Libellé', ph: 'ex. Réparation voiture' }, { k: 'amount', l: 'Montant (F CFP)', t: 'money' }], {},
@@ -1270,7 +1286,7 @@ const A = {
       v => { const n = { ...it, amount: v.amount, date: v.date || it.date, auto: false }; if (it.kind === 'charge' && it.bill && v.date) n.month = cycleOf(v.date);
         if (it.kind === 'saving') { n.name = v.name || it.name; if (it.sav !== 'fixed' && v.date) n.month = cycleOf(v.date); }
         if (it.kind === 'income' && v.date && v.date !== it.date) n.month = isSliding(incTypeOf(it.typeId)) ? v.date.slice(0, 7) : pOf(v.date, incDay(incTypeOf(it.typeId))); put('monthItems', n); },
-      () => remove('monthItems', id));
+      () => { if (it.plan && confirm('Supprimer aussi toutes les autres échéances de cet échéancier ?')) S.monthItems.filter(i => i.plan === it.plan).forEach(i => remove('monthItems', i.id)); else remove('monthItems', id); });
   },
   incomeType(id) {
     const t = id ? S.incomeTypes.find(x => x.id === id) : { id: uid(), name: '', variable: false, amount: 0, active: true };
@@ -1366,7 +1382,7 @@ const A = {
     let h = `<h3>Compte bancaire (estimé)</h3><div class="list">`;
     h += line('🏦', 'Solde saisi', 'le ' + fshort(st.date), fmt(st.amount));
     st.incomes.forEach(i => h += line('💶', esc(i.name), 'le ' + fshort(i.date), '+' + fmt(i.amount), 'pos'));
-    st.charges.forEach(c => h += c.bill ? line('🧾', esc(c.name), 'prélevé le ' + fshort(c.date), '−' + fmt(c.amount), 'neg') : line('📄', 'Charges fixes', 'budget de ' + fdate(c.ym + '-01', { month: 'long' }), '−' + fmt(c.amount), 'neg'));
+    st.charges.forEach(c => h += c.bill ? line(c.plan ? '📆' : '🧾', esc(c.name), 'prélevé le ' + fshort(c.date), '−' + fmt(c.amount), 'neg') : line('📄', 'Charges fixes', 'budget de ' + fdate(c.ym + '-01', { month: 'long' }), '−' + fmt(c.amount), 'neg'));
     st.savings.forEach(i => h += line(SAV[i.sav].ico, esc(i.name), (i.sav === 'back' ? 'depuis l’épargne' : 'vers l’épargne') + ', le ' + fshort(i.date), (i.sav === 'back' ? '+' : '−') + fmt(i.amount), i.sav === 'back' ? 'pos' : 'neg'));
     h += line('🧾', 'Dépenses saisies', 'depuis le ' + fshort(st.date), '−' + fmt(st.spent), 'neg');
     h += `<div class="row total-row"><span class="ico">=</span><div class="mid"><div>Solde estimé aujourd’hui</div></div><div class="amt ${st.balance < 0 ? 'neg' : 'pos'}">${fmt(st.balance)}</div></div></div>
