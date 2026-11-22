@@ -1,7 +1,7 @@
 // Service worker : permet à l'application de fonctionner hors connexion
 // et récupère toujours la dernière version publiée quand il y a du réseau.
-const CACHE = 'budget-hebdo-v42';
-const ASSETS = ['./', './index.html', './app.js', './config.js', './styles.css', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/favicon.png'];
+const CACHE = 'budget-hebdo-v43';
+const ASSETS = ['./', './index.html', './app.js', './config.js', './styles.css', './manifest.webmanifest', './icons/icon-192-v2.png', './icons/icon-512-v2.png', './icons/apple-touch-icon-v2.png', './icons/favicon-v2.png'];
 self.addEventListener('install', e => {
   // cache: 'reload' = on ignore le cache du navigateur pour prendre les fichiers tout juste publiés
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS.map(u => new Request(u, { cache: 'reload' })))));
