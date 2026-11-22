@@ -2,7 +2,7 @@
 /* Budget Hebdo — application de budget hebdomadaire (XPF)
    Données stockées localement (IndexedDB) + sauvegarde Google Drive. */
 
-const APP_VERSION = '2.11.0';
+const APP_VERSION = '2.12.0';
 const DRIVE_FOLDER = 'Budget Hebdo';
 const DRIVE_DATA = 'budget-data.json';
 // Moteur de lecture (Tesseract.js 5.1.1, licence Apache 2.0) hébergé avec l'app, dans le dossier tesseract/
@@ -77,7 +77,8 @@ function defaults() {
     ['Santé', '💊', 'pharmacie,médecin,docteur,laboratoire'],
     ['Maison', '🏠', 'bricolage,quincaillerie,mr bricolage,leroy'],
     ['Loisirs', '🎉', 'restaurant,snack,cinéma,bar'],
-    ['Divers', '📦', '']].map(([name, icon, keywords]) => ({ id: uid(), name, icon, keywords }));
+    ['Entretien', '🔧', 'garage,vidange,revision,révision,climatisation,clim'],
+    ['Divers', '📦', '']].map(([name, icon, keywords]) => ({ id: uid(), name, icon, keywords, spread: name === 'Entretien' }));
   dbPut('settings', S.settings);
   inc.forEach(o => { S.incomeTypes.push(o); dbPut('incomeTypes', o); });
   ch.forEach(o => { S.chargeTypes.push(o); dbPut('chargeTypes', o); });
@@ -285,10 +286,20 @@ function incomeTypesAll() {
   return list;
 }
 function incomeOn(s) { return incomeTypesAll().reduce((sum, t) => { if (isSliding(t)) return sum + slideOn(t, s); const p = incDay(t), K = pOf(s, p); return sum + incomeDaily(t, K)[pIdx(s, K, p)]; }, 0); }
-const dayBudget = s => { if (s < S.settings.startDate) return 0; const ym = cycleOf(s); const k = dayIdx(s, ym); return incomeOn(s) + chargeDaily(ym)[k] + savingDaily(ym)[k]; };
+const dayBudget = s => { if (s < S.settings.startDate) return 0; const ym = cycleOf(s); const k = dayIdx(s, ym); return incomeOn(s) + chargeDaily(ym)[k] + savingDaily(ym)[k] + spreadDaily(ym)[k]; };
 function monthDaily(ym) { const a = []; for (let d = cycleStart(ym); d <= cycleEnd(ym); d = addDays(d, 1)) a.push(dayBudget(d)); return a; }
+/* Dépenses « étalées » (entretien voiture, clim…) : retirées du budget de leur date jusqu'à la fin du mois budgétaire,
+   comme une charge, au lieu de peser seulement sur la semaine où elles tombent. */
+function spreadDaily(ym) {
+  const ck = 'x|' + ym; if (cache.daily.has(ck)) return cache.daily.get(ck);
+  const arr = new Array(cycleLen(ym)).fill(0);
+  S.expenses.forEach(e => { if (e.spread && e.date >= S.settings.startDate && cycleOf(e.date) === ym) spread(arr, -e.amount, dayIdx(e.date, ym)); });
+  cache.daily.set(ck, arr); return arr;
+}
+const spreadOn = s => s < S.settings.startDate ? 0 : -spreadDaily(cycleOf(s))[dayIdx(s, cycleOf(s))];
+const allSpentOn = s => s < S.settings.startDate ? 0 : S.expenses.reduce((t, e) => t + (e.date === s ? e.amount : 0), 0);
 function spentOn(s) {
-  if (!cache.spentByDay) { cache.spentByDay = new Map(); S.expenses.forEach(e => cache.spentByDay.set(e.date, (cache.spentByDay.get(e.date) || 0) + e.amount)); }
+  if (!cache.spentByDay) { cache.spentByDay = new Map(); S.expenses.forEach(e => { if (!e.spread) cache.spentByDay.set(e.date, (cache.spentByDay.get(e.date) || 0) + e.amount); }); }
   return s < S.settings.startDate ? 0 : (cache.spentByDay.get(s) || 0); // dépenses d'avant le début du suivi ignorées
 }
 function weekRaw(mon) {
@@ -473,7 +484,7 @@ function expRow(e) {
   const c = catOf(e.categoryId);
   return `<div class="row" onclick="A.expense('${e.id}')">
     ${e.photoId ? `<img class="thumb" data-photo="${e.photoId}" alt="">` : `<span class="bubble" style="--h:${catHue(e.categoryId)}">${c.icon || '•'}</span>`}
-    <div class="mid"><div>${esc(e.note || c.name)}</div><small>${esc(c.name)}${e.photoId ? ' · 📷' : ''}</small></div>
+    <div class="mid"><div>${esc(e.note || c.name)}</div><small>${esc(c.name)}${e.spread ? ' · 📆 étalée sur le mois' : ''}${e.photoId ? ' · 📷' : ''}</small></div>
     <div class="amt">${fmt(e.amount)}</div></div>`;
 }
 
@@ -505,9 +516,11 @@ function viewMonth() {
   const pend = pendingVariable(ym);
   const before = ym < startYm();
   const sv = before ? { out: 0, back: 0, net: 0, items: [] } : savTotals(ym);
+  const spr = before ? [] : S.expenses.filter(e => e.spread && e.date >= S.settings.startDate && cycleOf(e.date) === ym).sort((a, b) => a.date.localeCompare(b.date));
+  const tSp = spr.reduce((s, e) => s + e.amount, 0);
   let h = `<header class="topbar"><button class="nav-btn" onclick="A.month(-1)">‹</button><div class="tb-mid"><div class="wk-title cap">${fmonth(ym)}</div><div class="wk-sub">${cycleDay() === 1 ? 'Vue du mois' : 'Mois budgétaire ' + cycleLabel(ym)}</div></div><button class="nav-btn" onclick="A.month(1)">›</button></header>
-    <section class="hero ${tInc - tCh - sv.net < 0 ? 'bad' : 'ok'}"><div class="hero-row"><span class="hero-label">Solde du mois</span></div>
-    <div class="remain">${fmt(tInc - tCh - sv.net)}</div><div class="hero-sub">${fmt(tInc)} de revenus sur la période − ${fmt(tCh)} de charges${sv.net ? ` − ${fmt(sv.net)} d’épargne` : ''}</div></section>`;
+    <section class="hero ${tInc - tCh - sv.net - tSp < 0 ? 'bad' : 'ok'}"><div class="hero-row"><span class="hero-label">Solde du mois</span></div>
+    <div class="remain">${fmt(tInc - tCh - sv.net - tSp)}</div><div class="hero-sub">${fmt(tInc)} de revenus sur la période − ${fmt(tCh)} de charges${sv.net ? ` − ${fmt(sv.net)} d’épargne` : ''}${tSp ? ` − ${fmt(tSp)} d’entretien` : ''}</div></section>`;
   if (before) return h + `<div class="empty">Ce mois est avant la date de début de suivi (${fshort(S.settings.startDate)}).<br>Tu peux la modifier dans Réglages.</div>`;
   h += `<div class="section"><h2>Revenus <button onclick="A.addIncome('${ym}')">+ Ajouter</button></h2><div class="list">`;
   inc.sort((a, b) => a.from.localeCompare(b.from)).forEach(i => h += `<div class="row" ${i.id ? `onclick="A.editItem('${i.id}')"` : `onclick="A.addIncome('${ym}','${i.typeId}')"`}><span class="ico">${i.estimate ? '⏳' : '💶'}</span><div class="mid"><div>${esc(i.name)}${i.estimate ? ' (estimation)' : ''}</div><small>du ${fshort(i.from)} au ${fshort(i.to)}${i.estimate ? ` · ≈ ${fmt(i.part)} sur ce mois` : i.part !== i.amount ? ` · ${fmt(i.part)} sur ce mois` : ''}</small></div><div class="amt pos">+${fmt(i.amount)}</div></div>`);
@@ -520,6 +533,12 @@ function viewMonth() {
   billsPending(ym).filter(t => !(t.amount > 0)).forEach(t => h += `<div class="row" onclick="A.addBill('${ym}','${t.id}')"><span class="ico" style="--h:20">⏳</span><div class="mid"><div>${esc(t.name)}</div><small class="pending">En attente — touche pour saisir la facture</small></div><div class="amt">—</div></div>`);
   if (!ch.length) h += `<div class="empty">Aucune charge fixe ce mois-ci.</div>`;
   h += `</div></div>`;
+  // Dépenses étalées (entretien)
+  if (spr.length) {
+    h += `<div class="section"><h2>Dépenses étalées</h2><div class="list">`;
+    spr.forEach(e => { const c = catOf(e.categoryId); h += `<div class="row" onclick="A.expense('${e.id}')"><span class="ico" style="--h:${catHue(c.id)}">${c.icon || '🔧'}</span><div class="mid"><div>${esc(e.note || c.name)}</div><small>le ${fshort(e.date)} · réparti du ${fshort(e.date)} au ${fshort(cycleEnd(ym))}</small></div><div class="amt neg">−${fmt(e.amount)}</div></div>`; });
+    h += `</div></div>`;
+  }
   // Épargne : virements vers l'épargne et retours
   h += `<div class="section"><h2>Épargne <button onclick="A.savingMenu('${ym}')">+ Ajouter</button></h2><div class="list">`;
   sv.items.sort((a, b) => a.date.localeCompare(b.date)).forEach(i => { const k = SAV[i.sav]; h += `<div class="row" onclick="A.editItem('${i.id}')"><span class="ico" style="--h:${k.hue}">${k.ico}</span><div class="mid"><div>${esc(i.name)}</div><small>le ${fshort(i.date)} · ${k.sub(i)}</small></div><div class="amt ${i.sav === 'back' ? 'pos' : 'neg'}">${i.sav === 'back' ? '+' : '−'}${fmt(i.amount)}</div></div>`; });
@@ -535,7 +554,7 @@ function viewMonth() {
     for (let i = 0; i < 7; i++) { const d = addDays(m, i); if (d >= first && d <= last && d >= S.settings.startDate) { days++; part += arr[dayIdx(d, ym)]; } }
     h += `<tr class="${m === curMon ? 'cur' : ''}" onclick="A.openWeek('${m}')"><td><b>S${isoWeek(m).w}</b></td><td>${fshort(m)} → ${fshort(addDays(m, 6))}</td><td>${days}</td><td><b>${fmt(part)}</b></td></tr>`;
   }
-  h += `</table><p class="help">Les charges et l’épargne programmée sont réparties sur tous les jours du mois ; chaque revenu, épargne exceptionnelle ou retour d’épargne à partir de sa date. Une semaine à cheval prend une part de chaque mois.</p></div>`;
+  h += `</table><p class="help">Les charges et l’épargne programmée sont réparties sur tous les jours du mois ; chaque revenu, dépense étalée, épargne exceptionnelle ou retour d’épargne à partir de sa date. Une semaine à cheval prend une part de chaque mois.</p></div>`;
   // Dépenses du mois par catégorie
   const exps = S.expenses.filter(e => e.date >= first && e.date <= last); const tExp = exps.reduce((s, e) => s + e.amount, 0);
   const byCat = {}; exps.forEach(e => byCat[e.categoryId] = (byCat[e.categoryId] || 0) + e.amount);
@@ -623,7 +642,7 @@ function anaData(r) {
   const shops = {}; exps.forEach(e => { const label = (e.note || catOf(e.categoryId).name).trim(); const k = compact(label) || label; const o = shops[k] = shops[k] || { label, n: 0, v: 0, cat: e.categoryId }; o.n++; o.v += e.amount; });
   const months = r.months.filter(ym => ym >= startYm()).map(ym => {
     let rev = 0, ch = 0, sav = 0, sp = 0;
-    for (let d = cycleStart(ym); d <= cycleEnd(ym); d = addDays(d, 1)) { if (d < S.settings.startDate) continue; const k = dayIdx(d, ym); rev += incomeOn(d); ch -= chargeDaily(ym)[k]; sav -= savingDaily(ym)[k]; sp += spentOn(d); }
+    for (let d = cycleStart(ym); d <= cycleEnd(ym); d = addDays(d, 1)) { if (d < S.settings.startDate) continue; const k = dayIdx(d, ym); rev += incomeOn(d); ch -= chargeDaily(ym)[k]; sav -= savingDaily(ym)[k]; sp += allSpentOn(d); }
     return { ym, rev, ch, sav, avail: rev - ch - sav, spent: sp };
   });
   const end = B < today() ? B : today(), days = A > end ? 0 : Math.round((parseD(end) - parseD(A)) / 864e5) + 1;
@@ -688,7 +707,7 @@ function viewAnalysis() {
   const span = Math.round((parseD(d.B) - parseD(d.A)) / 864e5) + 1;
   if (span <= 100 && d.A <= d.B) {
     const groups = [];
-    for (let m = mondayOf(d.A); m <= d.B; m = addDays(m, 7)) { let b = 0, s = 0; for (let i = 0; i < 7; i++) { const x = addDays(m, i); if (x < d.A || x > d.B) continue; b += dayBudget(x); s += spentOn(x); } const w = isoWeek(m).w; groups.push({ x: 'S' + w, a: b, b: s, tip: `S${w} (${fshort(m)} → ${fshort(addDays(m, 6))}) : budget ${fmt(b)} · dépensé ${fmt(s)}${s > b ? ' · dépassé de ' + fmt(s - b) : ''}` }); }
+    for (let m = mondayOf(d.A); m <= d.B; m = addDays(m, 7)) { let b = 0, s = 0; for (let i = 0; i < 7; i++) { const x = addDays(m, i); if (x < d.A || x > d.B) continue; b += dayBudget(x) + spreadOn(x); s += allSpentOn(x); } const w = isoWeek(m).w; groups.push({ x: 'S' + w, a: b, b: s, tip: `S${w} (${fshort(m)} → ${fshort(addDays(m, 6))}) : budget ${fmt(b)} · dépensé ${fmt(s)}${s > b ? ' · dépassé de ' + fmt(s - b) : ''}` }); }
     h += `<div class="section"><h2>Budget et dépenses par semaine</h2><div class="chart-card">${legend2('Budget de la semaine', 'Dépensé')}${bars(groups, 'Budget et dépenses par semaine')}<div class="tip" aria-live="polite">Touche une semaine pour voir le détail</div><p class="help">Budget de la semaine sans le report des semaines précédentes.</p></div></div>`;
   }
   // Barres par mois
@@ -1082,6 +1101,7 @@ let draft = null;
 function expenseSheet(id, catId) {
   const e = id ? S.expenses.find(x => x.id === id) : null;
   draft = e ? { ...e, newBlob: null } : { id: null, date: today(), amount: '', categoryId: catId || (S.categories[0] || {}).id, note: '', photoId: null, newBlob: null };
+  if (!e) draft.spread = !!catOf(draft.categoryId).spread;
   const chips = S.categories.map(c => `<button type="button" class="chip ${c.id === draft.categoryId ? 'on' : ''}" data-cat="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('');
   sheet(`<h3>${e ? 'Modifier la dépense' : 'Nouvelle dépense'}</h3>
     <div class="photo-zone">
@@ -1095,18 +1115,20 @@ function expenseSheet(id, catId) {
       <label class="f"><span>Date</span><input type="date" name="date" value="${draft.date}"></label>
       <label class="f"><span>Catégorie</span></label><div class="chips" id="chips">${chips}</div>
       <label class="f"><span>Description (magasin, détail…)</span><input name="note" value="${esc(draft.note)}" placeholder="ex. Casino Johnston"></label>
+      <label class="chk"><input type="checkbox" name="spread" ${draft.spread ? 'checked' : ''}> Étaler sur la fin du mois budgétaire (entretien, grosse dépense)</label>
+      <p class="help">Cochée : la dépense est retirée du budget de sa date jusqu’à la fin du mois budgétaire, au lieu de peser seulement sur sa semaine.</p>
       <div class="btns"><button type="submit" class="btn">Enregistrer</button><button type="button" class="btn ghost" onclick="closeSheet()">Annuler</button></div>
       ${e ? `<div class="btns">${e.photoId ? `<button type="button" class="btn ghost" id="ph-rm">Retirer la photo</button>` : ''}<button type="button" class="btn danger" id="ex-del">Supprimer</button></div>` : ''}
     </form>`);
   if (draft.photoId) photoUrl(draft.photoId).then(u => $('#ph-prev').src = u);
   $('#ph-prev').onclick = () => { if ($('#ph-prev').src) window.open($('#ph-prev').src, '_blank'); };
-  $('#chips').onclick = ev => { const b = ev.target.closest('.chip'); if (!b) return; draft.categoryId = b.dataset.cat; document.querySelectorAll('#chips .chip').forEach(c => c.classList.toggle('on', c === b)); };
+  $('#chips').onclick = ev => { const b = ev.target.closest('.chip'); if (!b) return; draft.categoryId = b.dataset.cat; document.querySelectorAll('#chips .chip').forEach(c => c.classList.toggle('on', c === b)); syncSpreadBox(); };
   ['#ph-cam', '#ph-gal'].forEach(s => $(s).onchange = ev => ev.target.files[0] && handlePhoto(ev.target.files[0]));
   const f = $('#ef');
   f.onsubmit = async ev => {
     ev.preventDefault();
     const amount = toInt(f.amount.value); if (amount <= 0) { toast('Indique un montant'); return; }
-    const exp = { id: draft.id || uid(), date: f.date.value || today(), amount, categoryId: draft.categoryId, note: f.note.value.trim(), photoId: draft.photoId, created: draft.created || Date.now() };
+    const exp = { id: draft.id || uid(), date: f.date.value || today(), amount, categoryId: draft.categoryId, note: f.note.value.trim(), photoId: draft.photoId, created: draft.created || Date.now(), spread: f.spread.checked };
     if (draft.ocrStore && exp.note) learnAlias(draft.ocrStore, exp.note, exp.categoryId);
     if (draft.newBlob) {
       if (draft.oldPhotoId) await dbDel('photos', draft.oldPhotoId);
@@ -1121,6 +1143,8 @@ function expenseSheet(id, catId) {
     if ($('#ph-rm')) $('#ph-rm').onclick = () => { draft.oldPhotoId = draft.photoId; draft.photoId = null; draft.removePhoto = true; $('#ph-prev').classList.add('hidden'); $('#ph-rm').remove(); };
   }
 }
+/* Catégorie choisie : la case « étaler » suit le réglage de la catégorie (nouvelle dépense seulement) */
+function syncSpreadBox() { const f = $('#ef'); if (!f || draft.id) return; f.spread.checked = !!catOf(draft.categoryId).spread; }
 async function handlePhoto(file) {
   const o = $('#ocr'); o.classList.remove('hidden'); o.textContent = 'Compression de la photo…';
   try {
@@ -1141,7 +1165,7 @@ async function handlePhoto(file) {
     const noDate = !r.date;
     if (noDate && shot <= today()) f.date.value = shot;
     if (r.store && !f.note.value) { f.note.value = r.store; found.push('« ' + r.store + ' »'); }
-    if (r.categoryId) { draft.categoryId = r.categoryId; document.querySelectorAll('#chips .chip').forEach(c => c.classList.toggle('on', c.dataset.cat === r.categoryId)); found.push(catOf(r.categoryId).name); }
+    if (r.categoryId) { draft.categoryId = r.categoryId; document.querySelectorAll('#chips .chip').forEach(c => c.classList.toggle('on', c.dataset.cat === r.categoryId)); syncSpreadBox(); found.push(catOf(r.categoryId).name); }
     $('#ocr').innerHTML = (found.length ? `✅ Trouvé : ${esc(found.join(', '))}.${noDate ? '<br>📅 Date illisible sur le ticket : j’ai mis le jour de la photo (${fshort(f.date.value)}), corrige si besoin.' : ''}<br><b>Vérifie avant d’enregistrer.</b>` : '⚠️ Je n’ai pas réussi à lire le ticket. Saisis le montant à la main (la photo sera bien conservée).')
       + `<details style="margin-top:6px"><summary>Voir le texte lu</summary><pre style="white-space:pre-wrap;font-size:12px;margin:6px 0 0">${esc(text)}</pre></details>`;
   } catch (err) {
@@ -1504,7 +1528,8 @@ const A = {
     const c = id ? S.categories.find(x => x.id === id) : { id: uid(), name: '', icon: '🏷️', keywords: '' };
     form(id ? 'Modifier la catégorie' : 'Nouvelle catégorie', [
       { k: 'name', l: 'Nom', ph: 'ex. Courses' }, { k: 'icon', l: 'Icône (emoji)' },
-      { k: 'keywords', l: 'Mots-clés pour reconnaître les tickets (séparés par des virgules)', ph: 'ex. casino,carrefour' }], c,
+      { k: 'keywords', l: 'Mots-clés pour reconnaître les tickets (séparés par des virgules)', ph: 'ex. casino,carrefour' },
+      { k: 'spread', l: 'Étaler ces dépenses sur la fin du mois budgétaire (ex. Entretien)', t: 'chk', help: 'La case « étaler » sera cochée d’office pour chaque nouvelle dépense de cette catégorie (tu peux la décocher au cas par cas).' }], c,
       v => { if (!v.name) { toast('Nom requis'); return false; } put('categories', { ...c, ...v }); },
       id ? () => { const n = S.expenses.filter(e => e.categoryId === id).length; if (n) { alert(`Impossible : ${n} dépense(s) utilisent cette catégorie. Renomme-la plutôt.`); return; } remove('categories', id); } : null);
   },
